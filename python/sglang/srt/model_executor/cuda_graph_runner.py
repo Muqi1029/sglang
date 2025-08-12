@@ -169,7 +169,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             if server_args.disable_cuda_graph_padding:
                 capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
             else:
-                # Normal decoding
+                # Normal Decoding
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
             # Since speculative decoding requires more cuda graph memory, we
@@ -204,6 +204,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
     if server_args.cuda_graph_max_bs:
+        print(f"\033[92m {server_args.cuda_graph_max_bs=} \033[0m")
         # Adjust the bs based on the cuda_graph_max_bs
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
         if max(capture_bs) < server_args.cuda_graph_max_bs:
@@ -536,11 +537,7 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
-<<<<<<< HEAD
-        # init cuda graph
-=======
         # create a CUDA graph
->>>>>>> muqi/annot
         graph = torch.cuda.CUDAGraph()
 
         stream = self.stream
