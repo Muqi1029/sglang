@@ -86,6 +86,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
     Clean up, then freeze all remaining objects from being included
     in future collections if GC is disabled during capture.
     """
+    # this is gc
     gc.collect()
     should_freeze = not enable_cudagraph_gc
     if should_freeze:
@@ -535,7 +536,11 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+<<<<<<< HEAD
         # init cuda graph
+=======
+        # create a CUDA graph
+>>>>>>> muqi/annot
         graph = torch.cuda.CUDAGraph()
 
         stream = self.stream
@@ -596,12 +601,14 @@ class CudaGraphRunner:
         else:
             gathered_buffer = None
 
+        # this is about Eagle
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        # this is about LoRA
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
@@ -609,6 +616,7 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
+        # create a forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -637,6 +645,7 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
@@ -675,6 +684,7 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
+        # run the forward function twice to warm up the cache
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
@@ -685,6 +695,8 @@ class CudaGraphRunner:
             set_global_graph_memory_pool(torch.cuda.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+
+        # capture the graph!
         with torch.cuda.graph(
             graph, pool=get_global_graph_memory_pool(), stream=stream
         ):
