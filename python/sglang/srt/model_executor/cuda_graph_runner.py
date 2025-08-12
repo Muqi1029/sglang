@@ -99,6 +99,8 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
+
+        # For CustomOp
         if isinstance(sub, CustomOp):
             if reverse:
                 sub.leave_torch_compile()
@@ -166,6 +168,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             if server_args.disable_cuda_graph_padding:
                 capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
             else:
+                # Normal decoding
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
             # Since speculative decoding requires more cuda graph memory, we
@@ -200,14 +203,21 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
     if server_args.cuda_graph_max_bs:
+        # Adjust the bs based on the cuda_graph_max_bs
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
         if max(capture_bs) < server_args.cuda_graph_max_bs:
+            # step is 16
+            # max(capture_bs) => cuda_graph_max_bs + 1
             capture_bs += list(
                 range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
             )
+
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
+
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+
+    # get compile bs from the capture bs
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -237,13 +247,20 @@ class CudaGraphRunner:
         self.model_runner = model_runner
         self.graphs = {}
         self.output_buffers = {}
+
+        # Torch Compiler
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+
+        # Model Arch
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
@@ -258,9 +275,12 @@ class CudaGraphRunner:
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         rank0_log(f"Capture cuda graph bs {self.capture_bs}")
+
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+
+        # About Sepculative Decoding
         if model_runner.spec_algorithm.is_eagle():
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -290,9 +310,11 @@ class CudaGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
 
+        # Torch Compile
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        # Lora Config
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
@@ -300,6 +322,7 @@ class CudaGraphRunner:
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -463,12 +486,14 @@ class CudaGraphRunner:
                     self.model_runner.gpu_id,
                     empty_cache=False,
                 )
+
                 # Reverse the order to enable better memory sharing across cuda graphs.
                 capture_range = (
                     tqdm.tqdm(list(reversed(self.capture_bs)))
                     if get_tensor_model_parallel_rank() == 0
                     else reversed(self.capture_bs)
                 )
+
                 for i, bs in enumerate(capture_range):
                     if get_tensor_model_parallel_rank() == 0:
                         avail_mem = get_available_gpu_memory(
@@ -510,7 +535,9 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+        # init cuda graph
         graph = torch.cuda.CUDAGraph()
+
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
