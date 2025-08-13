@@ -127,6 +127,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             ),
         )
 
+        # router
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,

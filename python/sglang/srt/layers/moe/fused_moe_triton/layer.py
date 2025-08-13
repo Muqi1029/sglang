@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
 )
+from sglang.utils import annot_print
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -166,6 +167,11 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        annot_print("moe_ep_size", self.moe_ep_size)
+        annot_print("moe_ep_rank", self.moe_ep_rank)
+        annot_print("moe_tp_size", self.moe_tp_size)
+        annot_print("moe_tp_rank", self.moe_tp_rank)
+
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
         if self.moe_ep_size > 1:
@@ -217,6 +223,10 @@ class FusedMoE(torch.nn.Module):
             and self.use_enable_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
+        annot_print(
+            "intermediate_size_per_partition:", self.intermediate_size_per_partition
+        )
+        annot_print("num_local_experts", self.num_local_experts)
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,

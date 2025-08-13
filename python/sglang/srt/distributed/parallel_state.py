@@ -1366,6 +1366,7 @@ def initialize_model_parallel(
 
     moe_ep_size = expert_model_parallel_size
 
+    # MOE TP SIZE SET
     moe_tp_size = tensor_model_parallel_size // moe_ep_size
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"

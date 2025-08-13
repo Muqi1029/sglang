@@ -156,10 +156,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
-            print('\033[92m using jinja \033[0m')
+            print("\033[92m using jinja \033[0m")
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
-            print('\033[92m using conversation \033[0m')
+            print("\033[92m using conversation \033[0m")
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
