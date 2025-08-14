@@ -527,24 +527,35 @@ def _w8a8_block_fp8_matmul(
     tensor `C`.
     """
 
+    # get pid, <pid> => <pid_m, pid_n>
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)  # num of tiles in M
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)  # num of tiles in N
+
+    # find which group is this tile, these are the same for a group of pids
+    num_pid_in_group = (
+        GROUP_SIZE_M * num_pid_n
+    )  # there are num_pid_in_group pids in a group of M
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
+
+    # get <pid_m, pid_n>
+    pid_m = first_pid_m + (pid % group_size_m)  #
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # get the offset
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     As_ptrs = As + offs_am * stride_As_m
+
     offs_bsn = offs_bn // group_n
+
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -557,6 +568,7 @@ def _w8a8_block_fp8_matmul(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
+        # FP8 gemm happens here
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
