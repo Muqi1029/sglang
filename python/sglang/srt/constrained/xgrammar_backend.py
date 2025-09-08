@@ -178,11 +178,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.override_stop_tokens = override_stop_tokens
 
     def _from_context(self, ctx: CompiledGrammar, key_string: str) -> XGrammarGrammar:
+        # 1. create a matcher
         matcher = GrammarMatcher(
             ctx,
             max_rollback_tokens=MAX_ROLLBACK_TOKENS,
             override_stop_tokens=self.override_stop_tokens,
         )
+        # 2. create a XGrammarGrammar object
         return XGrammarGrammar(
             matcher, self.vocab_size, ctx, self.override_stop_tokens, key_string
         )

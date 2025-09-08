@@ -457,6 +457,7 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
+            # FIXME(Muqi1029): create grammar backend here
             self.grammar_backend = create_grammar_backend(
                 server_args,
                 self.tokenizer,
@@ -1278,6 +1279,7 @@ class Scheduler(
             or req.sampling_params.structural_tag is not None
         ):
             assert self.grammar_backend is not None
+            # select which format
             if req.sampling_params.json_schema is not None:
                 key = ("json", req.sampling_params.json_schema)
             elif req.sampling_params.regex is not None:
