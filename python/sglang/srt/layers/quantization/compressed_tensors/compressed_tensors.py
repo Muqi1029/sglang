@@ -637,6 +637,8 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         details
         """
         weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # use scheme to create weights
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,
