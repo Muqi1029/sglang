@@ -826,7 +826,6 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
-                send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
                 )
@@ -842,23 +841,21 @@ class SchedulerOutputProcessorMixin:
                     decode_ids_list.append(decode_ids)
                 else:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-
-                # Exclude the tokens after stop condition
-                output_ids_ = req.output_ids_through_stop
-
                 req.send_decode_id_offset = len(decode_ids)
-                read_offsets.append(read_offset)
-                output_ids.append(output_ids_[send_token_offset:])
-                req.send_token_offset = len(output_ids_)
+
+                # output_ids maybe removed latter
+                # read_offsets.append(read_offset)
+                # output_ids.append(output_ids_[send_token_offset:])
+                # req.send_token_offset = len(output_ids_)
+
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(output_ids_))
+                completion_tokens.append(len(decode_ids))
                 cached_tokens.append(req.cached_tokens)
-
                 retraction_counts.append(req.retraction_count)
 
                 if not self.spec_algorithm.is_none():

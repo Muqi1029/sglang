@@ -153,14 +153,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         bs = len(recv_obj.rids)
 
         # Initialize decode status
-        read_ids, surr_ids = [], []
+        read_ids = []
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],
-                    surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
                 self.decode_status[rid] = s
@@ -170,25 +169,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
             read_ids.append(
                 self.trim_matched_stop(
-                    s.decode_ids[s.surr_offset :],
+                    s.decode_ids[s.read_offset :],
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
                 )
             )
-            surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): better handle skip_special_tokens/spaces_between_special_tokens per request
         if self.disable_tokenizer_batch_decode:
-            surr_texts = [
-                self.tokenizer.decode(
-                    surr, skip_special_tokens=skip, spaces_between_special_tokens=space
-                )
-                for surr, skip, space in zip(
-                    surr_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
-                )
-            ]
             read_texts = [
                 self.tokenizer.decode(
                     read, skip_special_tokens=skip, spaces_between_special_tokens=space
@@ -200,11 +188,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
             ]
         else:
-            surr_texts = self.tokenizer.batch_decode(
-                surr_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
             read_texts = self.tokenizer.batch_decode(
                 read_ids,
                 skip_special_tokens=recv_obj.skip_special_tokens[0],
@@ -225,7 +208,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     f"The current value is {DETOKENIZER_MAX_STATES}. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
-            new_text = read_texts[i][len(surr_texts[i]) :]
+            new_text = read_texts[i]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):

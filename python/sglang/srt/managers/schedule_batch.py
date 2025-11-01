@@ -741,24 +741,18 @@ class Req:
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
-        first_iter = self.surr_offset is None or self.read_offset is None
+        first_iter = self.read_offset is None
 
         output_ids = self.output_ids_through_stop
 
         if first_iter:
-            self.read_offset = len(self.origin_input_ids_unpadded)
-            self.surr_offset = max(
-                self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
-            )
-            self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
-            )
-            self.cur_decode_ids_len = len(output_ids)
+            self.read_offset = 0
+            self.decode_ids = output_ids
         else:
-            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
-            self.cur_decode_ids_len = len(output_ids)
+            self.decode_ids.extend(output_ids[self.cur_decode_ids_len :])
+        self.cur_decode_ids_len = len(self.decode_ids)  # update for next
 
-        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
+        return self.decode_ids, self.read_offset
 
     def tail_str(self) -> str:
         # Check stop strings and stop regex patterns together
