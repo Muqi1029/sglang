@@ -846,8 +846,8 @@ class SchedulerOutputProcessorMixin:
                 read_offsets.append(read_offset)
 
                 # output_ids maybe removed latter
-                # read_offsets.append(read_offset)
-                # output_ids.append(output_ids_[send_token_offset:])
+                # output_ids_ = req.output_ids_through_stop
+                # output_ids.append(output_ids_[req.send_token_offset:])
                 # req.send_token_offset = len(output_ids_)
 
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)

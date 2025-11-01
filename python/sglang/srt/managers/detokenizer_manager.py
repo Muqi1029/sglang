@@ -62,7 +62,7 @@ class DecodeStatus:
 
     decoded_text: str
     decode_ids: List[int]
-    read_offset: int
+    read_offset: int = 0
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
 
@@ -159,7 +159,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],
-                    read_offset=recv_obj.read_offsets[i],
                 )
                 self.decode_status[rid] = s
             else:
@@ -173,6 +172,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     recv_obj.no_stop_trim[i],
                 )
             )
+        print(f"\033[42m {s.read_offset=} \033[0m")
 
         # TODO(lmzheng): better handle skip_special_tokens/spaces_between_special_tokens per request
         if self.disable_tokenizer_batch_decode:
