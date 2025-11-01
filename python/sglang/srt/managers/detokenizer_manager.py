@@ -62,7 +62,6 @@ class DecodeStatus:
 
     decoded_text: str
     decode_ids: List[int]
-    surr_offset: int
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
@@ -213,13 +212,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
                     s.decoded_text = s.decoded_text + new_text
-                    s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
                     new_text = ""
                 else:
                     new_text = find_printable_text(new_text)
-            else:
-                del self.decode_status[recv_obj.rids[i]]
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,

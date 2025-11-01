@@ -843,6 +843,8 @@ class SchedulerOutputProcessorMixin:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                 req.send_decode_id_offset = len(decode_ids)
 
+                read_offsets.append(read_offset)
+
                 # output_ids maybe removed latter
                 # read_offsets.append(read_offset)
                 # output_ids.append(output_ids_[send_token_offset:])
