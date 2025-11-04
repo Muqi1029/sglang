@@ -1089,7 +1089,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
+
+                # FIXME(Muqi1029): don't regenerate_rid
+                if not self.sampling_params[0]["use_beam_search"]:
+                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
@@ -1101,7 +1105,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 for _ in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    # tokenized_obj.rid = tmp_obj.regenerate_rid()
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)

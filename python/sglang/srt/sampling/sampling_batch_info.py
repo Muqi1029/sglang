@@ -48,6 +48,11 @@ class SamplingBatchInfo:
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
     acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
 
+    # Whether any request has beam search
+    has_beam_search: bool = True
+    beam_k: Optional[torch.Tensor] = None
+    beam_indices: Optional[torch.Tensor] = None
+
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
     # Custom parameters
@@ -78,6 +83,23 @@ class SamplingBatchInfo:
             dtype=torch.float,
             device=device,
         ).view(-1, 1)
+
+        # used for beam search
+        beam_k = []
+        beam_indices = []
+        for i, req in enumerate(reqs):
+            if req.sampling_params.use_beam_search:
+                beam_k.append(int(req.rid[-1]))
+                beam_indices.append(i)
+                has_beam_search = True
+                # set to false then it would use beam search latter
+                req.sampling_params.use_beam_search = False
+
+        beam_k_tensor = torch.tensor(beam_k, dtype=torch.int32, device=device)
+        beam_indices_tensor = torch.tensor(
+            beam_indices, dtype=torch.int32, device=device
+        )
+
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
         )
@@ -160,6 +182,9 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            has_beam_search=has_beam_search,
+            beam_k=beam_k_tensor,
+            beam_indices=beam_indices_tensor,
             sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),

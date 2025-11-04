@@ -91,6 +91,7 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
         else:
             can_sample_directly_from_probs = (
                 not sampling_info.need_top_p_sampling
@@ -201,6 +202,16 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
+        if sampling_info.has_beam_search:
+            need_resample_logits = logits[sampling_info.beam_indices]
+            max_k = (
+                torch.max(sampling_info.beam_k).item() + 1
+            )  # since idx states from 0
+            print(f"{max_k=}")
+            _, topk_indices = torch.topk(need_resample_logits, max_k, dim=-1)
+            batch_next_token_ids[sampling_info.beam_indices] = torch.gather(
+                topk_indices, sampling_info.beam_k, dim=1
+            ).flatten()
         return batch_next_token_ids
 
     def compute_logprobs_only(

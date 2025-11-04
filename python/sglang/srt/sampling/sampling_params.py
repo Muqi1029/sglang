@@ -59,7 +59,9 @@ class SamplingParams:
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: int = 42,
+        use_beam_search: bool = False,
     ) -> None:
+        self.use_beam_search = use_beam_search
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
         if stop_token_ids:

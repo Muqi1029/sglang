@@ -407,11 +407,18 @@ class GenerateReqInput(BaseReq):
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
+        if self.sampling_params["use_beam_search"]:
+            if self.rid is None:
+                self.rid = uuid.uuid4().hex
+
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
+
         elif isinstance(self.rid, str):
+            # FIXME(Muqi1029): needs passing str
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
+
         elif isinstance(self.rid, list):
             # Note: the length of rid shall be the same as the batch_size,
             # as the rid would be expanded for parallel sampling in tokenizer_manager
@@ -723,6 +730,7 @@ class EmbeddingReqInput(BaseReq):
 
         # check the batch size of input_ids
         if self.input_ids is not None:
+            # TODO(Muqi1029): maybe repeat here using batch_size to better get beam width
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
                 self.is_single = False
@@ -735,6 +743,7 @@ class EmbeddingReqInput(BaseReq):
                 self.rid = uuid.uuid4().hex
             if self.sampling_params is None:
                 self.sampling_params = {}
+            # FIXME(Muqi1029): why 0?
             self.sampling_params["max_new_tokens"] = 0
         else:
             if self.rid is None:

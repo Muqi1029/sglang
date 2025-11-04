@@ -511,6 +511,8 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    use_beam_search: bool = False
+    num_beam_samples: int = 1
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -538,6 +540,18 @@ class ChatCompletionRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="after")
+    def check_beam_settings(self):
+        if not self.use_beam_search and self.num_beam_samples != 1:
+            raise ValueError(
+                f"If use_beam_search=False, num_beam_samples must be 1 (got {self.num_beam_samples})."
+            )
+        if self.use_beam_search and self.num_beam_samples < 1:
+            raise ValueError(
+                f"If use_beam_search=True, num_beam_samples must be greater than 1 (got {self.num_beam_samples})."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -644,6 +658,8 @@ class ChatCompletionRequest(BaseModel):
             "regex": self.regex,
             "ebnf": self.ebnf,
             "n": self.n,
+            "num_beam_samples": self.num_beam_samples,
+            "use_beam_search": self.use_beam_search,
             "no_stop_trim": self.no_stop_trim,
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,
