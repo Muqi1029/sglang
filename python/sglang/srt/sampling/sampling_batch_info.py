@@ -49,7 +49,7 @@ class SamplingBatchInfo:
     acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
 
     # Whether any request has beam search
-    has_beam_search: bool = True
+    has_beam_search: bool = False
     beam_k: Optional[torch.Tensor] = None
     beam_indices: Optional[torch.Tensor] = None
 
@@ -87,13 +87,16 @@ class SamplingBatchInfo:
         # used for beam search
         beam_k = []
         beam_indices = []
+        has_beam_search = False
         for i, req in enumerate(reqs):
             if req.sampling_params.use_beam_search:
                 beam_k.append(int(req.rid[-1]))
+                print(req.rid)
                 beam_indices.append(i)
                 has_beam_search = True
                 # set to false then it would use beam search latter
                 req.sampling_params.use_beam_search = False
+            print(req.sampling_params.use_beam_search)
 
         beam_k_tensor = torch.tensor(beam_k, dtype=torch.int32, device=device)
         beam_indices_tensor = torch.tensor(

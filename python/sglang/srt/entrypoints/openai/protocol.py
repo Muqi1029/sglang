@@ -511,6 +511,8 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+
+    # For pseudo beam search
     use_beam_search: bool = False
     num_beam_samples: int = 1
 
@@ -658,7 +660,6 @@ class ChatCompletionRequest(BaseModel):
             "regex": self.regex,
             "ebnf": self.ebnf,
             "n": self.n,
-            "num_beam_samples": self.num_beam_samples,
             "use_beam_search": self.use_beam_search,
             "no_stop_trim": self.no_stop_trim,
             "ignore_eos": self.ignore_eos,

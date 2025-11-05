@@ -202,16 +202,21 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
+        print(f"{sampling_info.has_beam_search=}")  # why it is always true
         if sampling_info.has_beam_search:
-            need_resample_logits = logits[sampling_info.beam_indices]
+            need_resample_probs = probs[sampling_info.beam_indices]
             max_k = (
                 torch.max(sampling_info.beam_k).item() + 1
             )  # since idx states from 0
-            print(f"{max_k=}")
-            _, topk_indices = torch.topk(need_resample_logits, max_k, dim=-1)
-            batch_next_token_ids[sampling_info.beam_indices] = torch.gather(
-                topk_indices, sampling_info.beam_k, dim=1
-            ).flatten()
+            _, topk_indices = torch.topk(need_resample_probs, max_k, dim=-1)
+            batch_next_token_ids[sampling_info.beam_indices] = (
+                torch.gather(
+                    topk_indices, index=sampling_info.beam_k.view(-1, 1), dim=1
+                )
+                .flatten()
+                .to(batch_next_token_ids.dtype)
+            )
+            sampling_info.has_beam_search = False
         return batch_next_token_ids
 
     def compute_logprobs_only(
