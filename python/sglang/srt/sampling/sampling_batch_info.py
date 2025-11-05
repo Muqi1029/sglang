@@ -71,6 +71,9 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    #
+    is_first_copy: bool = True
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -91,12 +94,12 @@ class SamplingBatchInfo:
         for i, req in enumerate(reqs):
             if req.sampling_params.use_beam_search:
                 beam_k.append(int(req.rid[-1]))
-                print(req.rid)
+                # print(req.rid)
                 beam_indices.append(i)
                 has_beam_search = True
                 # set to false then it would use beam search latter
                 req.sampling_params.use_beam_search = False
-            print(req.sampling_params.use_beam_search)
+            # print(req.sampling_params.use_beam_search)
 
         beam_k_tensor = torch.tensor(beam_k, dtype=torch.int32, device=device)
         beam_indices_tensor = torch.tensor(
@@ -391,7 +394,13 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        if self.is_first_copy:
+            self.is_first_copy = False
+        else:
+            self.has_beam_search = False
+        return dataclasses.replace(
+            self, penalizer_orchestrator=None, has_beam_search=self.has_beam_search
+        )
 
 
 def merge_bias_tensor(

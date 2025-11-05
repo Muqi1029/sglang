@@ -661,6 +661,7 @@ class ChatCompletionRequest(BaseModel):
             "ebnf": self.ebnf,
             "n": self.n,
             "use_beam_search": self.use_beam_search,
+            "num_beam_samples": self.num_beam_samples,
             "no_stop_trim": self.no_stop_trim,
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,

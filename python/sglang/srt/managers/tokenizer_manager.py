@@ -1102,8 +1102,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 for j in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
-                    tokenized_obj.rid = tmp_obj.rid + f"_{j}"
+                    tmp_obj.rid += f"_{j}"
+                    tokenized_obj.rid = tmp_obj.rid
+                    # tokenized_obj.rid = tmp_obj.rid + f"_{j}"
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    # print(f"\033[42m send {tokenized_obj.rid} \033[0m")
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 

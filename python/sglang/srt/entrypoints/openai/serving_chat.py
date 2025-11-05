@@ -717,7 +717,6 @@ class OpenAIServingChat(OpenAIServingBase):
         """Build chat completion response from generation results"""
         choices = []
 
-        print(f"\033[42m{len(ret)=}\033[0m")
         for idx, ret_item in enumerate(ret):
             # Process logprobs
             choice_logprobs = None

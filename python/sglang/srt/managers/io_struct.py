@@ -236,6 +236,7 @@ class GenerateReqInput(BaseReq):
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
+
             self.input_embeds = None
         else:
             if isinstance(self.input_embeds[0][0], float):
@@ -262,14 +263,16 @@ class GenerateReqInput(BaseReq):
                     )
 
         # If using parallel sampling with a single example, convert to batch
+        num_beam_samples = self.sampling_params.get("num_beam_samples", 1)
+        self.batch_size *= num_beam_samples
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
             if self.text is not None:
-                self.text = [self.text]
+                self.text = [self.text] * num_beam_samples
             if self.input_ids is not None:
-                self.input_ids = [self.input_ids]
+                self.input_ids = [self.input_ids] * num_beam_samples
             if self.input_embeds is not None:
-                self.input_embeds = [self.input_embeds]
+                self.input_embeds = [self.input_embeds] * num_beam_samples
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -416,7 +419,7 @@ class GenerateReqInput(BaseReq):
 
         elif isinstance(self.rid, str):
             # FIXME(Muqi1029): needs passing str
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            new_rids = [f"{self.rid}_{i}" for i in range(self.batch_size)]
             self.rid = new_rids
 
         elif isinstance(self.rid, list):

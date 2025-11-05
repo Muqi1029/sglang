@@ -202,7 +202,7 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
-        print(f"{sampling_info.has_beam_search=}")  # why it is always true
+        # print(f"{sampling_info.has_beam_search=} {id(sampling_info)=}")
         if sampling_info.has_beam_search:
             need_resample_probs = probs[sampling_info.beam_indices]
             max_k = (
@@ -216,6 +216,8 @@ class Sampler(nn.Module):
                 .flatten()
                 .to(batch_next_token_ids.dtype)
             )
+            # print(f"\033[42m {sampling_info.beam_indices=} \033[0m")
+            # print(f"\033[42m {batch_next_token_ids[sampling_info.beam_indices]=} \033[0m")
             sampling_info.has_beam_search = False
         return batch_next_token_ids
 
