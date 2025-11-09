@@ -340,6 +340,7 @@ class SchedulerOutputProcessorMixin:
                             indices_to_free = batch.out_cache_loc[i : i + 1]
 
                 if indices_to_free is not None:
+                    print("\033[42m indices_to_free \033[0m")
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 continue
 
@@ -377,6 +378,7 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.tree_cache.cache_finished_req(req)
                 else:
+                    print(f"\033[42m prepare for cache_finished_req \033[0m")
                     self.tree_cache.cache_finished_req(req)
 
                 req.time_stats.completion_time = time.perf_counter()
@@ -852,9 +854,9 @@ class SchedulerOutputProcessorMixin:
                 read_offsets.append(read_offset)
 
                 # output_ids maybe removed latter
-                # output_ids_ = req.output_ids_through_stop
-                # output_ids.append(output_ids_[req.send_token_offset:])
-                # req.send_token_offset = len(output_ids_)
+                output_ids_ = req.output_ids_through_stop
+                output_ids.append(output_ids_[req.send_token_offset :])
+                req.send_token_offset = len(output_ids_)
 
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
