@@ -873,7 +873,7 @@ class SchedulerOutputProcessorMixin:
 
                 read_offsets.append(read_offset)
 
-                # output_ids maybe removed latter
+                # decode_ids maybe removed latter
                 output_ids_ = req.output_ids_through_stop
                 output_ids.append(output_ids_[req.send_token_offset :])
                 req.send_token_offset = len(output_ids_)
@@ -884,7 +884,7 @@ class SchedulerOutputProcessorMixin:
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(decode_ids))
+                completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
                 retraction_counts.append(req.retraction_count)
 
