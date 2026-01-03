@@ -618,7 +618,9 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
             body = {
                 "activities": getattr(args, "profile_activities", []),
             }
-            async with session.post(url=api_url, json=body) as response:
+            async with session.post(
+                url=api_url, headers=get_auth_headers(), json=body
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
