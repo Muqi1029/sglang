@@ -974,6 +974,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
+
+                if self.reasoning_parser == "minimax-append-think":
+                    text = text.split("</think>")[1]
+
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = orjson.loads(text)
                 tool_calls = []
