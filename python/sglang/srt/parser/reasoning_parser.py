@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
@@ -268,10 +268,25 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         if not self.is_first_chunk:
             self.is_first_chunk = True
             new_text = self.think_start_token + new_text
-        return StreamingParseResult(normal_text=new_text)
+        return super().parse_streaming_increment(new_text)
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
-        return StreamingParseResult(normal_text=self.think_start_token + text)
+        return super().parse_streaming_increment(self.think_start_token + text)
+
+    def append_think_to_content(self, messages: List) -> List:
+        new_messages = []
+        for message in messages:
+            if message.role == "assistant" and message.reasoning_content:
+                content = message.content or ""
+                message.content = (
+                    self.think_start_token
+                    + message.reasoning_content
+                    + self.think_end_token
+                    + content
+                )
+                message.reasoning_content = None
+            new_messages.append(message)
+        return new_messages
 
 
 class NanoV3Detector(BaseReasoningFormatDetector):
@@ -352,3 +367,10 @@ class ReasoningParser:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
+
+    def append_think_to_content(self, messages):
+        if not isinstance(self.detector, MiniMaxAppendThinkDetector):
+            raise ValueError(
+                "Only minimax-append-think can use append_think_to_content"
+            )
+        return self.detector.append_think_to_content(messages)
