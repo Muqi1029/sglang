@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
+    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -516,7 +517,9 @@ class MinimaxM2Detector(BaseFormatDetector):
         return self._convert_param_value_with_types(pval, param_type)
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError
+        return lambda name: StructureInfo(
+            begin=f'<invoke name="{name}"', end="</invoke>", trigger="<invoke"
+        )
