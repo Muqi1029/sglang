@@ -166,11 +166,17 @@ class FunctionCallParser:
             )
             schema = function.parameters if is_strict else {}
 
+            # HACK(muqi1029@gmail.com)
+            end = info.end
+            if (
+                isinstance(self.detector, MinimaxM2Detector)
+                and parallel_tool_calls is False
+            ):
+                end = info.end + self.detector.tool_call_end_token
+
             tool_structures.append(
                 StructuresResponseFormat(
-                    begin=info.begin,
-                    schema=schema or {},  # type: ignore
-                    end=info.end,
+                    begin=info.begin, schema=schema or {}, end=end  # type: ignore
                 )
             )
             tool_trigger_set.add(info.trigger)
@@ -182,6 +188,7 @@ class FunctionCallParser:
             structures=tool_structures,
             triggers=list(tool_trigger_set),
         )
+        return legacy_structural_tag
         if grammar_backend == "xgrammar" and is_xgrammar_available:
             structural_tag = StructuralTag.from_legacy_structural_tag(
                 tags=tool_structures, triggers=list(tool_trigger_set)

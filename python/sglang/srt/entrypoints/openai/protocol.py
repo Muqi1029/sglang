@@ -692,9 +692,14 @@ class ChatCompletionRequest(BaseModel):
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
-                )
+                if isinstance(constraint_value, (dict, str)):
+                    sampling_params[constraint_type] = convert_json_schema_to_str(
+                        constraint_value
+                    )
+                else:
+                    sampling_params[constraint_type] = convert_json_schema_to_str(
+                        constraint_value.model_dump(by_alias=True)
+                    )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value  # type: ignore

@@ -3,6 +3,8 @@ import logging
 import re
 from typing import Any, Dict, List, Tuple
 
+import orjson
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -477,22 +479,31 @@ class MinimaxM2Detector(BaseFormatDetector):
 
     def _parse_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
         res: List[ToolCallItem] = []
+
         for m in self.tool_call_function_regex.findall(block):
+
             txt = m[0] if m[0] else m[1]
+            print(f"\033[42m {txt=} \033[0m")
+
             if '">' not in txt:
                 continue
             idx = txt.index('">')
             fname = txt[:idx].strip()
             body = txt[idx + 2 :]
             params: Dict[str, Any] = {}
-            for pm in self.tool_call_parameter_regex.findall(body):
-                ptxt = pm[0] if pm[0] else pm[1]
-                if '">' not in ptxt:
-                    continue
-                pidx = ptxt.index('">')
-                pname = ptxt[:pidx].strip()
-                pval = ptxt[pidx + 2 :].lstrip("\n").rstrip("\n")
-                params[pname] = self._parse_parameter(fname, pname, pval, tools)
+
+            # TODO(muqi1029@gmail.com): handle json format
+            if body.strip().startswith("{") and body.strip().endswith("}"):
+                params = orjson.loads(body)
+            else:
+                for pm in self.tool_call_parameter_regex.findall(body):
+                    ptxt = pm[0] if pm[0] else pm[1]
+                    if '">' not in ptxt:
+                        continue
+                    pidx = ptxt.index('">')
+                    pname = ptxt[:pidx].strip()
+                    pval = ptxt[pidx + 2 :].lstrip("\n").rstrip("\n")
+                    params[pname] = self._parse_parameter(fname, pname, pval, tools)
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function
@@ -521,5 +532,40 @@ class MinimaxM2Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<invoke name="{name}"', end="</invoke>", trigger="<invoke"
+            begin=f'<invoke name="{name}">', end="</invoke>", trigger="<invoke"
         )
+
+    def build_structure_tag(self, tools: List[Tool], parallel_tool_calls: bool):
+        # content_dict = {"type": "tags_with_separator", "separator": "\n", "tags": []}
+        # for tool in tools:
+        #     tool_tag = {
+        #         "type": "tag",
+        #         "begin": f'<invoke name="{tool.function.name}">\n',
+        #         "end": "\n</invoke>",
+        #         "content": {
+        #             "type": "json_schema",
+        #             "json_schema": (
+        #                 tool.function.parameters
+        #                 if tool.function.parameters
+        #                 else {"type": "object", "properties": {}}
+        #             ),
+        #         },
+        #     }
+        #     content_dict["tags"].append(tool_tag)
+        # content_dict["stop_after_first"] = not parallel_tool_calls
+
+        # return {
+        #     "format": {
+        #         "type": "triggered_tags",
+        #         "triggers": [self.tool_call_start_token],
+        #         "tags": [
+        #             {
+        #                 "begin": self.tool_call_start_token,
+        #                 "end": self.tool_call_end_token,
+        #                 "content": content_dict,
+        #             }
+        #         ],
+        #         "stop_after_first": True,
+        #     }
+        # }
+        pass

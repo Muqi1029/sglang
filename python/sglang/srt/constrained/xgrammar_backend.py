@@ -304,6 +304,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 )
             else:
                 format_dict = structural_tag.get("format")
+                print(f"\033[42m using new structural_tag, {format_dict} \033[0m")
                 if isinstance(format_dict, dict):
                     self._sanitize_structural_format(format_dict)
                     structural_tag["format"] = format_dict
