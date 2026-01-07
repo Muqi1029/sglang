@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -247,15 +248,22 @@ class MinimaxM2Detector(BaseFormatDetector):
             # Look for tool call start
             if not self._in_tool_call:
                 s = self._buf.find(self.tool_call_start_token)
+                # not find _buf
                 if s == -1:
                     normal += self._buf
                     self._buf = ""
                     break
 
+                # Extract normal text
                 normal += self._buf[:s]
+
+                # Move buf to the start position of tool call(containing tool_call_start_token)
                 self._buf = self._buf[s:]
 
+                # Set _in_tool_call as True since tool_call_start_token has been found
                 self._in_tool_call = True
+
+                # Initiate State
                 self._function_name_sent = False
                 self._current_function_name = ""
                 self._current_parameters = {}
@@ -376,6 +384,36 @@ class MinimaxM2Detector(BaseFormatDetector):
             List of ToolCallItem objects to emit (may be empty)
         """
         calls: List[ToolCallItem] = []
+
+        # Processing json first
+        if text_to_parse.strip().startswith("{"):
+            new_text_to_parse = text_to_parse.strip()
+            if new_text_to_parse.endswith(self.tool_call_end_token):
+                new_text_to_parse.rstrip(self.tool_call_end_token)
+            for token in reversed(["</", "invoke", ">"]):
+                if new_text_to_parse.endswith(token):
+                    new_text_to_parse = new_text_to_parse.rstrip(token)
+            prev_streamed_args = self.streamed_args_for_tool[self.current_tool_id]
+            delta_args = new_text_to_parse[len(prev_streamed_args) :]
+            self.streamed_args_for_tool[self.current_tool_id] = new_text_to_parse
+            if delta_args:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=delta_args,
+                    )
+                )
+            if _is_complete_json(new_text_to_parse):
+                # Update the stored arguments
+                try:
+                    parsed_args = json.loads(new_text_to_parse)
+                    self.prev_tool_call_arr[self.current_tool_id][
+                        "arguments"
+                    ] = parsed_args
+                except json.JSONDecodeError:
+                    pass
+            return calls
 
         # Find all complete parameter patterns
         param_matches = list(
