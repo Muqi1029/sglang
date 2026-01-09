@@ -295,9 +295,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = ("json_schema", json_schema)
 
         # process messages
-        parser = ReasoningParser(model_type=self.reasoning_parser)
-        request.messages = parser.append_think_to_content(request.messages)
-        print(f"\033[42m {request.messages=} \033[0m")
+        if self.reasoning_parser == "minimax-append-think":
+            parser = ReasoningParser(model_type=self.reasoning_parser)
+            request.messages = parser.append_think_to_content(request.messages)
+            # print(f"\033[42m {request.messages=} \033[0m")
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
