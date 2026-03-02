@@ -22,11 +22,13 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.jit_kernel.utils import register_jit_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
@@ -108,6 +110,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
     )
 
 
@@ -116,20 +119,18 @@ def create_fused_set_kv_buffer_arg(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ):
-    from sgl_kernel import FusedSetKVBufferArg
+    from sglang.jit_kernel.rope import FusedSetKVBufferArg
 
     layer_id = layer.layer_id
     token_to_kv_pool = forward_batch.token_to_kv_pool
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-
+    assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
     return FusedSetKVBufferArg(
         value=value,
         k_buffer=k_buffer.view(k_buffer.shape[0], -1),
         v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-        k_scale=layer.k_scale,
-        v_scale=layer.v_scale,
         cache_loc=forward_batch.out_cache_loc,
     )
 
@@ -223,7 +224,6 @@ def apply_qk_norm(
     Returns:
         Tuple of normalized query and key tensors
     """
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
@@ -233,7 +233,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and can_use_fused_inplace_qknorm(head_dim)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
@@ -246,7 +246,7 @@ def apply_qk_norm(
         return q, k
 
     if alt_stream is not None and get_is_capture_mode():
-        current_stream = torch.cuda.current_stream()
+        current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
         q_by_head = q.reshape(-1, head_dim)
         q_by_head = q_norm(q_by_head)
@@ -265,4 +265,4 @@ def apply_qk_norm(
 
 
 # Register the inplace op
-fused_inplace_qknorm = register_jit_op(fused_inplace_qknorm, out_args=["q", "k"])
+fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])

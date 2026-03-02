@@ -1,28 +1,33 @@
 from __future__ import annotations
 
 import functools
-import inspect
+import os
 import pathlib
-from functools import lru_cache
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    List,
-    Optional,
-    Tuple,
-    TypeAlias,
-    TypeVar,
-    Union,
-    overload,
-)
+from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
 import torch
 
-from sglang.srt.utils.common import direct_register_custom_op
-
 if TYPE_CHECKING:
     from tvm_ffi import Module
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
 
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:
@@ -30,7 +35,7 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
-@lru_cache()
+@cache_once
 def _resolve_kernel_path() -> pathlib.Path:
     cur_dir = pathlib.Path(__file__).parent.resolve()
 
@@ -55,13 +60,32 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = [
+    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
 
 class CPPArgList(list[str]):
     def __str__(self) -> str:
         return ", ".join(self)
+
+
+CPP_DTYPE_MAP = {
+    torch.float: "fp32_t",
+    torch.float16: "fp16_t",
+    torch.float8_e4m3fn: "fp8_e4m3_t",
+    torch.bfloat16: "bf16_t",
+    torch.int8: "int8_t",
+    torch.int64: "int64_t",
+}
+
+
+# AMD/ROCm note:
+@cache_once
+def is_hip_runtime() -> bool:
+    return bool(torch.version.hip)
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -70,6 +94,8 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             return "true" if arg else "false"
         if isinstance(arg, (int, float)):
             return str(arg)
+        if isinstance(arg, torch.dtype):
+            return CPP_DTYPE_MAP[arg]
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
@@ -138,36 +164,30 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
-    return load_inline(
-        "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
-        cpp_sources=cpp_sources,
-        cuda_sources=cuda_sources,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-        extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-        build_directory=build_directory,
-    )
-
-
-F = TypeVar("F", bound=Callable[..., Any])
-
-
-def cache_once(fn: F) -> F:
-    """
-    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
-    So we manually implement a simple cache_once decorator to replace it.
-    """
-    result_map = {}
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
-        if key not in result_map:
-            result_map[key] = fn(*args, **kwargs)
-        return result_map[key]
-
-    return wrapper  # type: ignore
+    # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
+    env_key = "TVM_FFI_CUDA_ARCH_LIST"
+    env_existed = env_key in os.environ
+    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
+    if is_hip_runtime():
+        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
+        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
+    if not env_existed:
+        os.environ[env_key] = _get_cuda_arch_list()
+    try:
+        return load_inline(
+            "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
+            cpp_sources=cpp_sources,
+            cuda_sources=cuda_sources,
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )
+    finally:
+        # Reset TVM_FFI_CUDA_ARCH_LIST to original state (not exist)
+        if not env_existed:
+            del os.environ[env_key]
 
 
 @cache_once
@@ -178,104 +198,9 @@ def is_arch_support_pdl() -> bool:
     return torch.cuda.get_device_capability(device)[0] >= 9
 
 
-def fake_inplace_impl(*args, **kwargs) -> None:
-    pass
-
-
-@overload
-def register_jit_op(
-    fn: F,
-    *,
-    op_name: Optional[str] = None,
-    out_list: Optional[List[int]] = None,
-    out_args: Optional[List[str]] = None,
-    fake_impl: Optional[Callable] = fake_inplace_impl,
-) -> F: ...
-
-
-@overload
-def register_jit_op(
-    *,
-    op_name: Optional[str] = None,
-    out_list: Optional[List[int]] = None,
-    out_args: Optional[List[str]] = None,
-    fake_impl: Optional[Callable] = fake_inplace_impl,
-) -> Callable[[F], F]: ...
-
-
-# Real implementation
-def register_jit_op(
-    fn=None,
-    *,
-    op_name: Optional[str] = None,
-    out_list: Optional[List[int]] = None,
-    out_args: Optional[List[str]] = None,
-    fake_impl: Optional[Callable] = fake_inplace_impl,
-) -> Any:
-    """
-    A decorator to register a JIT custom operator.
-
-    Example usage:
-    ```python
-    @register_jit_op(op_name="my_op", out_list=[0])
-    def my_inplace_op(x: torch.Tensor) -> None:
-        x.add_(1)
-
-    def fake_impl(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return x + y
-
-    @register_jit_op(op_name="my_op2", out_args=["x"], fake_impl=fake_impl)
-    def my_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return x.add_(y)
-    ```
-
-    :param fn: The function to be registered as a JIT custom operator.
-               If None, return a decorator.
-    :type fn: Callable
-    :param op_name: The name of the operator. If None, use the function name
-    :type op_name: Optional[str]
-    :param out_list: A list of argument indices that are mutated in-place.
-    :type out_list: Optional[List[int]]
-    :param out_args: A list of argument names that are mutated in-place.
-    :type out_args: Optional[List[str]]
-    :param fake_impl: A fake implementation for the operator, used for
-                      torch.compile compatibility.
-                      By default, a no-op function is used, which suits
-                      for most in-place operations.
-    :type fake_impl: Optional[Callable]
-    :return: The registered JIT custom operator, or a decorator.
-             NOTE: the real register will occur at the first call of the function.
-    :rtype: Callable
-    """
-
-    def decorator(fn):
-        real_impl = None
-        resolved_name = op_name or fn.__name__
-
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            nonlocal real_impl
-            if real_impl is None:
-                if not hasattr(torch.ops.sglang, resolved_name):
-                    signature = inspect.signature(fn)
-                    mutates_args = []
-                    param_names = list(signature.parameters.keys())
-                    for id in out_list or []:
-                        mutates_args.append(param_names[id])
-                    for name in out_args or []:
-                        mutates_args.append(name)
-                    mutates_args = list(set(mutates_args))
-                    direct_register_custom_op(
-                        op_name=resolved_name,
-                        op_func=fn,
-                        mutates_args=mutates_args,
-                        fake_impl=fake_impl,
-                    )
-                real_impl = getattr(torch.ops.sglang, resolved_name)
-            return real_impl(*args, **kwargs)
-
-        return wrapper
-
-    if fn is not None:
-        return decorator(fn)
-    return decorator
+@cache_once
+def _get_cuda_arch_list() -> str:
+    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"{major}.{minor}"

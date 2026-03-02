@@ -36,19 +36,23 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -66,8 +70,8 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -199,6 +203,35 @@ class Engine(EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
+    def _resolve_routed_dp_rank(
+        self,
+        routed_dp_rank: Optional[int],
+        data_parallel_rank: Optional[int],
+    ) -> Optional[int]:
+        if data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if routed_dp_rank is None:
+                routed_dp_rank = data_parallel_rank
+
+        if self.server_args.enable_dp_attention:
+            if routed_dp_rank is None:
+                logger.debug("routed_dp_rank not provided, using default dispatch")
+            elif routed_dp_rank < 0:
+                raise ValueError("routed_dp_rank must be non-negative")
+            elif routed_dp_rank >= self.server_args.dp_size:
+                raise ValueError(
+                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
+                )
+
+        logger.debug(f"routed_dp_rank: {routed_dp_rank}")
+        return routed_dp_rank
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -229,22 +262,22 @@ class Engine(EngineBase):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
+        # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        if self.server_args.enable_dp_attention:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.dp_size:
-                raise ValueError(
-                    f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
-                )
+        routed_dp_rank = self._resolve_routed_dp_rank(
+            routed_dp_rank, data_parallel_rank
+        )
 
         obj = GenerateReqInput(
             text=prompt,
@@ -265,8 +298,12 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
-            data_parallel_rank=data_parallel_rank,
+            routed_dp_rank=routed_dp_rank,
+            disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -310,29 +347,28 @@ class Engine(EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
+        # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        routed_dp_rank = self._resolve_routed_dp_rank(
+            routed_dp_rank, data_parallel_rank
+        )
 
-        if self.server_args.enable_dp_attention:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.dp_size:
-                raise ValueError(
-                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
-                )
-
-        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -346,13 +382,18 @@ class Engine(EngineBase):
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             return_hidden_states=return_hidden_states,
+            return_routed_experts=return_routed_experts,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
-            data_parallel_rank=data_parallel_rank,
+            routed_dp_rank=routed_dp_rank,
+            disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -368,6 +409,8 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
@@ -380,6 +423,8 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            lora_path=lora_path,
+            external_trace_header=external_trace_header,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -393,6 +438,8 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
@@ -407,6 +454,8 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            lora_path=lora_path,
+            external_trace_header=external_trace_header,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -438,6 +487,45 @@ class Engine(EngineBase):
 
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def open_session(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+        streaming: bool = False,
+        timeout: Optional[float] = None,
+    ) -> str:
+        """Open a session for multi-turn conversation with shared context.
+
+        Args:
+            capacity_of_str_len: Maximum string length capacity for the session.
+            session_id: Optional session ID. If not provided, a UUID will be generated.
+            streaming: Use low-overhead path for realtime streaming (append-only mode).
+            timeout: If set, the session is automatically closed after being inactive
+                for this many seconds. Inactivity is measured from session open or the
+                most recent request submission.
+
+        Returns:
+            The session ID (either the provided one or a newly generated UUID).
+        """
+        obj = OpenSessionReqInput(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+            streaming=streaming,
+            timeout=timeout,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.open_session(obj, None)
+        )
+
+    def close_session(self, session_id: str) -> None:
+        """Close a session and release its resources.
+
+        Args:
+            session_id: The session ID to close.
+        """
+        obj = CloseSessionReqInput(session_id=session_id)
+        self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
@@ -590,6 +678,22 @@ class Engine(EngineBase):
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def load_lora_adapter_from_tensors(
+        self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+    ):
+        # Load LoRA adapter again
+        serialized_tensors = MultiprocessingSerializer.serialize(
+            tensors, output_str=True
+        )
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
@@ -775,7 +879,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.5.3",
+                "0.6.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -783,32 +887,65 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sgl-kernel",
-                "0.3.20",
+                "0.3.21",
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
-    if server_args.custom_sigquit_handler is None:
-        # Register the signal handler.
-        # The child processes will send SIGQUIT to this process when any error happens
-        # This process then clean up the whole process tree
-        # Note: This sigquit handler is used in the launch phase, and may be replaced by
-        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
-        def launch_phase_sigquit_handler(signum, frame):
-            logger.error(
-                "Received sigquit from a child process. It usually means the child failed."
-            )
-            kill_process_tree(os.getpid())
+    # Signal handlers can only be registered from the main thread.
+    if threading.current_thread() is threading.main_thread():
+        if server_args.custom_sigquit_handler is None:
+            # Register the signal handler.
+            # The child processes will send SIGQUIT to this process when any error happens
+            # This process then clean up the whole process tree
+            # Note: This sigquit handler is used in the launch phase, and may be replaced by
+            # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+            def launch_phase_sigquit_handler(signum, frame):
+                logger.error(
+                    "Received sigquit from a child process. It usually means the child failed."
+                )
+                kill_process_tree(os.getpid())
 
-        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        else:
+            # Allow users to register a custom SIGQUIT handler for things like crash dump
+            logger.error(
+                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+            )
+            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
     else:
-        # Allow users to register a custom SIGQUIT handler for things like crash dump
-        logger.error(
-            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+        logger.warning(
+            "Signal handler is not added because the engine is not in the "
+            "main thread. This disables the SIGQUIT handler for cleaning up "
+            "the process tree when a child process fails."
         )
-        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _wait_for_scheduler_ready(
+    scheduler_pipe_readers: List,
+    scheduler_procs: List,
+) -> List[Dict]:
+    """Wait for the model to finish loading and return scheduler infos."""
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+    return scheduler_infos
 
 
 def _launch_scheduler_processes(
@@ -847,7 +984,29 @@ def _launch_scheduler_processes(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                attn_dp_size = (
+                    server_args.dp_size if server_args.enable_dp_attention else 1
+                )
+
+                # Parallelism hierarchy (outermost to innermost):
+                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
+                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
+                attn_tp_size = (
+                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                )
+                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
+                )
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // server_args.moe_dp_size)
+                    // (
+                        server_args.tp_size
+                        // server_args.moe_dp_size
+                        // server_args.ep_size
+                    )
+                )
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
@@ -857,6 +1016,8 @@ def _launch_scheduler_processes(
                             port_args,
                             gpu_id,
                             tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
                             moe_ep_rank,
                             pp_rank,
                             None,
@@ -916,17 +1077,23 @@ def _launch_subprocesses(
         run_scheduler_process_func=run_scheduler_process_func,
     )
 
+    if (
+        server_args.enable_elastic_expert_backup
+        and server_args.elastic_ep_backend is not None
+    ):
+        run_expert_backup_manager(server_args, port_args)
+
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            assert data["status"] == "ready"
+        scheduler_infos = _wait_for_scheduler_ready(
+            scheduler_pipe_readers, scheduler_procs
+        )
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None, port_args
+            return None, None, scheduler_infos, port_args
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
@@ -937,7 +1104,7 @@ def _launch_subprocesses(
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None, None, port_args
+        return None, None, scheduler_infos, port_args
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -960,23 +1127,7 @@ def _launch_subprocesses(
         template_manager = None
 
     # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
+    scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
 
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]

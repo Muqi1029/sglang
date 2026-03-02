@@ -19,15 +19,15 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 |---------------------------------|-----------------------------|------------------|-----------------|-----------------|-----------------|--------------------|----------------|
 | **FlashInfer**                  | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ❌             |
 | **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ✅             |
-| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
+| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ✅             |
 | **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅              | ✅                 | ✅             |
 | **Torch Native (SDPA)**         | ❌                          | ✅               | ✅              | ❌              | ❌              | ❌                 | ✅             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
 | **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ✅              | ❌              | ✅                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ❌               | ❌              | ✅              | ✅              | ❌                 | ✅             |
+| **AITER (ROCm)**                | ✅                          | ✅               | ❌              | ✅              | ✅              | ❌                 | ✅             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ✅             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ✅              | ❌              | ❌                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
 | **Intel AMX (CPU)**             | ❌                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
 
@@ -49,8 +49,12 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 ```
 
 ```{note}
-- FlashAttention 4 is prefill-only for now.
+- FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). On SM90, `page_size` must be 128.
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
+```
+
+```{warning}
+**FA4 on Hopper (SM90):** FA4 decode speed decreases as sequence length grows due to lack of SplitKV support. At batch=1 compared to FA3 on H100: ~-10% at 2K tokens, ~-18% at 4K, ~-31% at 8K, ~-49% at 16K. Larger batch sizes reduce the gap (e.g., batch=8: ~-2% at 2K, ~-8% at 4K). Blackwell (SM100) is not affected.
 ```
 
 ```{note}
@@ -110,6 +114,23 @@ Constraints when combining hybrid attention with speculative decoding:
 If you set only one of `--prefill-attention-backend` or `--decode-attention-backend`, the unspecified phase inherits `--attention-backend`.
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 ```
+
+## Attention Backend Selection Guide (CUDA)
+
+If the `--attention-backend` argument is not specified, SGLang automatically selects the best backend based on the hardware (CUDA) and model architecture.
+
+### Automatic Selection Logic
+
+**1. MHA Models (e.g., Llama, Qwen)**
+- **Hopper (e.g., H100, H200)**: Defaults to `fa3` if using CUDA 12.3+ and the model configuration is supported.
+- **Blackwell (e.g., B200)**: Defaults to `trtllm_mha`, unless using speculative decoding with `topk > 1`.
+- **Other Architectures (Ampere, Ada, etc.)**: Defaults to `flashinfer` if available; otherwise falls back to `triton`.
+
+**2. MLA Models (e.g., DeepSeek V3)**
+- **Hopper**: Defaults to `fa3` (requires CUDA 12.3+).
+- **Blackwell**: Defaults to `trtllm_mla`.
+- **Other Architectures**: Defaults to `triton`.
+
 
 ## User Guide
 
@@ -187,6 +208,13 @@ python3 -m sglang.launch_server \
 
 - FlashAttention 4 (MHA & MLA)
 ```bash
+# FA4 for both prefill and decode on SM90/SM100
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --attention-backend fa4 \
+  --page-size 128 \
+  --trust-remote-code
+
 python3 -m sglang.launch_server \
   --tp 8 \
   --model deepseek-ai/DeepSeek-R1 \
