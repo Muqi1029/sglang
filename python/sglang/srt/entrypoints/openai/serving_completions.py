@@ -318,6 +318,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     chunk.usage = UsageProcessor.calculate_token_usage(
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        reasoning_tokens=reasoning_tokens.get(index, 0),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
