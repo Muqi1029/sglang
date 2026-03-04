@@ -46,6 +46,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -197,6 +198,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
     "flashinfer_trtllm",
+    "flashinfer_cutlass",
     "flashinfer_deepgemm",
     "cutlass",
     "triton",
@@ -215,7 +217,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
 
 
 # Allow external code to add more choices
@@ -926,8 +928,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, etc.)
-        if is_hip() or is_npu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, etc.)
+        if is_hip() or is_npu() or is_cpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -1486,10 +1488,16 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             if self.moe_runner_backend == "auto":
-                if is_blackwell_supported() and is_mxfp4_quant_format:
+                if is_sm100_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
-                        "Detected Blackwell and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                    )
+                elif is_sm120_supported() and is_mxfp4_quant_format:
+                    # trtllm-gen only supports SM100
+                    self.moe_runner_backend = "triton_kernel"
+                    logger.warning(
+                        "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
                     )
                 elif (
                     is_hip() and get_bool_env_var("SGLANG_USE_AITER")
@@ -2035,9 +2043,28 @@ class ServerArgs:
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
         ):
-            if not is_sm100_supported():
+            # Check prefill backend
+            prefill_backend = (
+                self.prefill_attention_backend
+                if self.prefill_attention_backend is not None
+                else self.attention_backend
+            )
+            if prefill_backend == "trtllm_mha" and not is_sm100_supported():
                 raise ValueError(
-                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                    "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
+                )
+
+            # Check decode backend
+            decode_backend = (
+                self.decode_attention_backend
+                if self.decode_attention_backend is not None
+                else self.attention_backend
+            )
+            if decode_backend == "trtllm_mha" and not (
+                is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            ):
+                raise ValueError(
+                    "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
                 )
 
             if self.page_size not in [16, 32, 64]:
@@ -4059,6 +4086,7 @@ class ServerArgs:
             "Options: 'auto' (default, auto-selects based on hardware), "
             "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
             "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), "
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
