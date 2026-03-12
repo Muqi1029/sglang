@@ -217,6 +217,7 @@ class ScheduleBatchBeamSearchMixin:
             beam_end = beam_offset + req.beam_width
 
             normal_kvcache = req_pool[normal_idx, :seq_len].squeeze(0)
+            # copy normal kvcache to beam kvcache
             beam_indices = beam_req_pool_indices[beam_start:beam_end]
             req_pool[beam_indices, :seq_len] = normal_kvcache
 

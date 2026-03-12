@@ -127,8 +127,11 @@ class SchedulerBeamSearchProcessorMixin:
 
             start_idx = offset
             end_idx = offset + req.beam_width
+
+            # update the offset for the next request
             offset = end_idx
-            topk = req.beam_candidates
+
+            topk = req.beam_candidates  # 2 x beam_width
             top_tokens = beam_output_top_tokens[start_idx:end_idx, :topk]
             top_logprobs = beam_output_top_logprobs[start_idx:end_idx, :topk]
             last_batch_slot_indices = self._process_beam_search_expansion(
@@ -710,6 +713,11 @@ class SchedulerBeamSearchProcessorMixin:
                     if len(incomplete) >= beam_width:
                         break
 
+        # update req.beam_list info for next forward step:
+        # 1. last_tokens: [beam_width]
+        # 2. cum_logprobs: [beam_width]
+        # 3. incomplete: [beam_width]
+
         req.beam_list.incomplete = incomplete
         req.beam_list.completed += completed
 
@@ -811,7 +819,7 @@ class SchedulerBeamSearchProcessorMixin:
         Args:
             batch: Schedule batch containing all requests' state information
             reqs: List of requests to process (only includes requests needing KV cache operations)
-            last_batch_slot_indices_list: List of surviving beam positions in batch for each request
+            last_batch_slot_indices_list: List of surviving beam positions in batch for each request, which may be duplicate.
         """
         prompt_lens = torch.cat([req.beam_list.prompt_lens for req in reqs])
 
@@ -850,6 +858,7 @@ class SchedulerBeamSearchProcessorMixin:
             batch.device,
         )
 
+        # free those out_cache_loc that appear in the last_beam_kv_indices
         uniques, counts = torch.unique(
             torch.cat([last_beam_kv_indices, keep_kv_indices]), return_counts=True
         )
@@ -1040,14 +1049,25 @@ class SchedulerBeamSearchProcessorMixin:
         unique_src_indices, inverse_indices = torch.unique(
             src_indices, return_inverse=True
         )
+        # unique_src_indices: [N], N <= group_size
+        # inverse_indices: [group_size], each element is the index of unique_src_indices
+
+        # Get the unique src req_to_token rows, Shape: [N, seq_len - prefix_len]
         kvcache_batch_unique = self.req_to_token_pool.req_to_token[
             unique_src_indices, prefix_len:seq_len
         ].clone()
+        # reshape back to group_size
         kvcache_batch = kvcache_batch_unique[inverse_indices]
+
+        # write to distinct dst req_to_token rows
         self.req_to_token_pool.req_to_token[dst_indices, prefix_len:seq_len] = (
             kvcache_batch
         )
-        return kvcache_batch_unique.flatten().unique()
+
+        # return the unique out_cache_loc of new beam rows
+        return (
+            kvcache_batch_unique.flatten().unique()
+        )  # Shape: [M], M <= group_size * (seq_len - prefix_len)
 
     def _collect_beam_req_decode_kv_indices(
         self: Scheduler, batch: ScheduleBatch, finished_reqs: List[Req]
