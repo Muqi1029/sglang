@@ -40,7 +40,12 @@ def get_model_config(
 
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
+        architectures = config.architectures
+        quantization_config = config.quantization_config
         config = config.get_text_config()
+        config.architectures = architectures
+        config.quantization_config = quantization_config
+        # print(f"\033[42m set {architectures=} \033[0m")
 
     block_shape = None
     if (

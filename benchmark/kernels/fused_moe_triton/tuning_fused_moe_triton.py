@@ -3,7 +3,7 @@ import argparse
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 import torch
@@ -50,7 +50,7 @@ def benchmark_config(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     per_channel_quant: bool,
-    block_shape: List[int] = None,
+    block_shape: Optional[List[int]] = None,
     num_iters: int = 100,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
@@ -115,7 +115,7 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
-    if use_int4_w4a16:
+    if use_int4_w4a16 and block_shape:
         block_n = 1 if (block_shape[0] == 0) else block_shape[0]
         block_k = block_shape[1]
         n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n

@@ -51,7 +51,9 @@ def get_answer_value(answer_str):
 
 def run_eval(args):
     # Select backend
-    set_default_backend(RuntimeEndpoint(normalize_base_url(args.host, args.port)))
+    set_default_backend(
+        RuntimeEndpoint(args.base_url or normalize_base_url(args.host, args.port))
+    )
 
     if args.data_path is None:
         # Read data
@@ -147,6 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-questions", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
+    parser.add_argument("--base-url", type=str)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--temperature", type=float, default=0.0)

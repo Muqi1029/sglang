@@ -736,19 +736,27 @@ class ModelRunnerKVCacheMixin:
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
+        print(
+            f"\033[42m {estimated=} {self.model_config.context_len=} {token_capacity=} \033[0m"
+        )
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
             max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
         else:
             max_num_reqs = min(estimated, token_capacity // 2)
+        print(f"\033[42m {max_num_reqs=} \033[0m")
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
+            print(
+                f"\033[42m {self.server_args.max_mamba_cache_size=} {ratio=} (In mambaish_config) \033[0m"
+            )
 
+        print(f"\033[42m {max_num_reqs=} (After mambaish_config) \033[0m")
         return max_num_reqs
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):

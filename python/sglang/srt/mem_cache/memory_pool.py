@@ -145,6 +145,7 @@ class ReqToTokenPool:
                 (size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(size))
+        print(f"\033[42m {self.req_to_token.shape} \033[0m")
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
