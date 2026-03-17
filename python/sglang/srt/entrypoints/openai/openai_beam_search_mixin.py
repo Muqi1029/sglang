@@ -37,7 +37,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
 )
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from sglang.srt.entrypoints.openai.utils import process_routed_experts_from_ret
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
@@ -53,7 +52,6 @@ class OpenAIBeamSearchMixin:
     # These attributes should be provided by the parent class
     tokenizer_manager: TokenizerManager
     reasoning_parser: Optional[str]
-    tool_call_parser: Optional[str]
 
     # ==================== Chat Completion Beam Search Methods ====================
 
@@ -157,23 +155,6 @@ class OpenAIBeamSearchMixin:
                 )
                 yield f"data: {reasoning_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-            # If there are tool calls, send them
-            if choice.message.tool_calls:
-                for tool_call in choice.message.tool_calls:
-                    tool_call_chunk = ChatCompletionStreamResponse(
-                        id=request_id,
-                        created=created,
-                        choices=[
-                            ChatCompletionResponseStreamChoice(
-                                index=choice.index,
-                                delta=DeltaMessage(tool_calls=[tool_call]),
-                                finish_reason=None,
-                            )
-                        ],
-                        model=request.model,
-                    )
-                    yield f"data: {tool_call_chunk.model_dump_json(exclude_none=True)}\n\n"
-
             # Send content if present
             if choice.message.content:
                 content_chunk = ChatCompletionStreamResponse(
@@ -266,7 +247,6 @@ class OpenAIBeamSearchMixin:
     ) -> List[ChatCompletionResponseChoice]:
         """Convert beam search results to ChatCompletionResponseChoice objects."""
         choices = []
-        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
 
         for beam_idx, beam_result in enumerate(beam_results):
             text = beam_result.get("text", "")
@@ -292,32 +272,11 @@ class OpenAIBeamSearchMixin:
             beam_meta_info = beam_result.get("meta_info", {})
             finish_reason = beam_meta_info.get("finish_reason")
             sequence_score = beam_meta_info.get("sequence_score")
-            routed_experts = process_routed_experts_from_ret(beam_result, request)
 
-            # Handle tool calls
-            tool_calls = None
-            if (
-                request.tool_choice != "none"
-                and request.tools
-                and self.tool_call_parser
-            ):
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    request.tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
-                # Accumulate tool calls count for next beam result
-                if tool_calls:
-                    history_tool_calls_cnt += len(tool_calls)
-
-            # Build sgl_ext if any extension field is present
             sgl_ext = None
-            if sequence_score is not None or routed_experts is not None:
+            if sequence_score is not None:
                 sgl_ext = SglExt(
                     sequence_score=sequence_score,
-                    routed_experts=routed_experts,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -325,7 +284,6 @@ class OpenAIBeamSearchMixin:
                 message=ChatMessage(
                     role="assistant",
                     content=text if text else None,
-                    tool_calls=tool_calls,
                     reasoning_content=(reasoning_text if reasoning_text else None),
                 ),
                 logprobs=None,
@@ -498,14 +456,11 @@ class OpenAIBeamSearchMixin:
             beam_meta_info = beam_result.get("meta_info", {})
             finish_reason = beam_meta_info.get("finish_reason")
             sequence_score = beam_meta_info.get("sequence_score")
-            routed_experts = process_routed_experts_from_ret(beam_result, request)
 
-            # Build sgl_ext if any extension field is present
             sgl_ext = None
-            if sequence_score is not None or routed_experts is not None:
+            if sequence_score is not None:
                 sgl_ext = SglExt(
                     sequence_score=sequence_score,
-                    routed_experts=routed_experts,
                 )
 
             choice_data = CompletionResponseChoice(
