@@ -30,6 +30,7 @@ def get_thinking_kwargs(args):
 
 def parse_json_object(value: str) -> dict:
     try:
+        print(value)
         parsed = json.loads(value)
     except json.JSONDecodeError as e:
         raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
