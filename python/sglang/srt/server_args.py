@@ -5605,7 +5605,7 @@ class ServerArgs:
             "--gc-threshold",
             type=int,
             nargs="+",
-            help="Set the garbage collection thresholds(the collection frequency)",
+            help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
         )
 
         # Dynamic batch tokenizer
