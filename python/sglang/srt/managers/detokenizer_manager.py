@@ -38,6 +38,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizer
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    configure_gc,
     configure_logger,
     freeze_gc,
     kill_itself_when_parent_died,
@@ -420,6 +421,7 @@ def run_detokenizer_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
+    configure_gc(server_args)
     parent_process = psutil.Process().parent()
 
     manager = None

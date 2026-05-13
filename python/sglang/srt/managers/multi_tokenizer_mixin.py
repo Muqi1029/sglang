@@ -49,7 +49,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import configure_gc, configure_logger, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
@@ -424,6 +424,9 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+        configure_logger(server_args)
+        configure_gc(server_args)
+
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"

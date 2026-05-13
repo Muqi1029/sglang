@@ -101,7 +101,6 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
-    configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -484,8 +483,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if self.server_args.gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=self.server_args.soft_watchdog_timeout,

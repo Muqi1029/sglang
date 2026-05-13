@@ -212,6 +212,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
+    configure_gc,
     configure_gc_logger,
     configure_logger,
     empty_device_cache,
@@ -3929,6 +3930,7 @@ def configure_scheduler_process(
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
+    configure_gc(server_args)
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process

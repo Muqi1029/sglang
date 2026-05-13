@@ -483,7 +483,7 @@ class ServerArgs:
     bucket_e2e_request_latency: Optional[List[float]] = None
     prompt_tokens_buckets: Optional[List[str]] = None
     generation_tokens_buckets: Optional[List[str]] = None
-    gc_warning_threshold_secs: float = 0.0
+    gc_warning_threshold_secs: float = 0.01
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None

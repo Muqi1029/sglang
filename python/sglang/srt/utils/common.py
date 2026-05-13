@@ -3199,8 +3199,6 @@ def gc_object_counts():
 
 
 def configure_gc_warning(warn_threshold_secs):
-    import gc
-
     gc_start_time = {}
 
     def gc_callback(phase, info):
@@ -3211,12 +3209,50 @@ def configure_gc_warning(warn_threshold_secs):
             duration = time.time() - gc_start_time.get(gen, time.time())
             if duration > warn_threshold_secs:
                 g0, g1, g2 = gc_object_counts()
-                logger.warn(
+                logger.warning(
                     f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
                     f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
                 )
 
     gc.callbacks.append(gc_callback)
+
+
+# def configure_gc_logger():
+#     logger.info("Enable GC Logger")
+#
+#     gc_start_time = {}
+#
+#     def gc_callback(phase, info):
+#         gen = info.get("generation", "?")
+#         if phase == "start":
+#             gc_start_time[gen] = time.time()
+#             logger.info(f"GC start: Time {time.time()} | Generation {gen}")
+#         elif phase == "stop":
+#             duration = time.time() - gc_start_time.get(gen, time.time())
+#             collected = info.get("collected", "?")
+#             uncollectable = info.get("uncollectable", "?")
+#             logger.info(
+#                 f"GC end: Time {time.time()} | Generation {gen} | "
+#                 f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
+#                 f'{"(LONG GC)" if duration > 0.1 else ""}'
+#             )
+#
+#     gc.callbacks.append(gc_callback)
+#
+
+
+def configure_gc(server_args):
+    if (gc_warning_threshold_secs := server_args.gc_warning_threshold_secs) > 0.0:
+        logger.info(
+            f"\033[42m [PID={os.getpid()}] set gc_warning_threshold_secs: {gc_warning_threshold_secs} \033[0m"
+        )
+        configure_gc_warning(gc_warning_threshold_secs)
+
+    if gc_threshold := server_args.gc_threshold:
+        logger.info(
+            f"\033[42m [PID={os.getpid()}] set gc_threshold: {gc_threshold} \033[0m"
+        )
+        gc.set_threshold(*gc_threshold)
 
 
 def freeze_gc(context: str):
@@ -3229,29 +3265,6 @@ def freeze_gc(context: str):
         f"gen1: {g1_before}->{g1_after}, "
         f"gen2: {g2_before}->{g2_after}"
     )
-
-
-def configure_gc_logger():
-    logger.info("Enable GC Logger")
-
-    gc_start_time = {}
-
-    def gc_callback(phase, info):
-        gen = info.get("generation", "?")
-        if phase == "start":
-            gc_start_time[gen] = time.time()
-            logger.info(f"GC start: Time {time.time()} | Generation {gen}")
-        elif phase == "stop":
-            duration = time.time() - gc_start_time.get(gen, time.time())
-            collected = info.get("collected", "?")
-            uncollectable = info.get("uncollectable", "?")
-            logger.info(
-                f"GC end: Time {time.time()} | Generation {gen} | "
-                f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-                f'{"(LONG GC)" if duration > 0.1 else ""}'
-            )
-
-    gc.callbacks.append(gc_callback)
 
 
 # COPIED FROM DeepGEMM

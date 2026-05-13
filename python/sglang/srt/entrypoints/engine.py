@@ -91,6 +91,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
+    configure_gc,
     configure_logger,
     get_bool_env_var,
     is_cuda,
@@ -696,6 +697,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         # Configure global environment
         configure_logger(server_args)
+        configure_gc(server_args)
         _set_envs_and_config(server_args)
 
         # Defensive: ensure plugins loaded (may already be loaded by
@@ -703,7 +705,6 @@ class Engine(EngineScoreMixin, EngineBase):
         load_plugins()
 
         server_args.check_server_args()
-        _set_gc(server_args)
 
         # Allocate ports for inter-process communications
         if port_args is None:
@@ -1242,13 +1243,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
-
-def _set_gc(server_args: ServerArgs):
-    if gc_threshold := server_args.gc_threshold:
-        import gc
-
-        gc.set_threshold(*gc_threshold)
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
