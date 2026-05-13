@@ -3217,28 +3217,27 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-# def configure_gc_logger():
-#     logger.info("Enable GC Logger")
-#
-#     gc_start_time = {}
-#
-#     def gc_callback(phase, info):
-#         gen = info.get("generation", "?")
-#         if phase == "start":
-#             gc_start_time[gen] = time.time()
-#             logger.info(f"GC start: Time {time.time()} | Generation {gen}")
-#         elif phase == "stop":
-#             duration = time.time() - gc_start_time.get(gen, time.time())
-#             collected = info.get("collected", "?")
-#             uncollectable = info.get("uncollectable", "?")
-#             logger.info(
-#                 f"GC end: Time {time.time()} | Generation {gen} | "
-#                 f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-#                 f'{"(LONG GC)" if duration > 0.1 else ""}'
-#             )
-#
-#     gc.callbacks.append(gc_callback)
-#
+def configure_gc_logger():
+    logger.info("Enable GC Logger")
+
+    gc_start_time = {}
+
+    def gc_callback(phase, info):
+        gen = info.get("generation", "?")
+        if phase == "start":
+            gc_start_time[gen] = time.time()
+            logger.info(f"GC start: Time {time.time()} | Generation {gen}")
+        elif phase == "stop":
+            duration = time.time() - gc_start_time.get(gen, time.time())
+            collected = info.get("collected", "?")
+            uncollectable = info.get("uncollectable", "?")
+            logger.info(
+                f"GC end: Time {time.time()} | Generation {gen} | "
+                f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
+                f'{"(LONG GC)" if duration > 0.1 else ""}'
+            )
+
+    gc.callbacks.append(gc_callback)
 
 
 def configure_gc(server_args):
