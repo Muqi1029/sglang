@@ -5,15 +5,15 @@ import triton.language as tl
 @triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
-    Predicts,
-    AcceptIndex,
-    AcceptTokenNum,
-    Candidates,
-    RetriveIndex,
-    UniformSamples,
-    UniformSamplesFinal,
-    TargetProbs,
-    DraftProbs,
+    Predicts,  # (bs * (gemma + 1), )
+    AcceptIndex,  # (bs, gemma + 1)
+    AcceptTokenNum,  # (bs, )
+    Candidates,  # (bs, gemma + 1)
+    RetriveIndex,  # (bs, gemma + 1)
+    UniformSamples,  # (bs, gemma)
+    UniformSamplesFinal,  # (bs,)
+    TargetProbs,  # (bs, gemma + 1, vocab_size)
+    DraftProbs,  # (bs, gemma, vocab_size)
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -28,16 +28,16 @@ def speculative_sampling_classic_kernel(
     stride_dp_s,
     stride_dp_v,
     # Constants
-    NUM_SLOTS: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,  # gemma + 1
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
 
-    cand_ptr_base = Candidates + pid * stride_cand_b
-    idx_ptr_base = RetriveIndex + pid * stride_idx_b
-    uni_ptr_base = UniformSamples + pid * stride_uni_b
+    cand_ptr_base = Candidates + pid * stride_cand_b  # candidate[pid]
+    idx_ptr_base = RetriveIndex + pid * stride_idx_b  # retrive_index[pid]
+    uni_ptr_base = UniformSamples + pid * stride_uni_b  # uniform_samples[pid]
 
     root_global_idx = tl.load(idx_ptr_base + 0 * stride_idx_s)
     tl.store(AcceptIndex + pid * stride_idx_b + 0 * stride_idx_s, root_global_idx)
@@ -176,6 +176,7 @@ def chain_speculative_sampling_triton(
     threshold_acc,
     deterministic,  # not used
 ):
+    # num_slots: gemma + 1
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
 

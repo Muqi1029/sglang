@@ -914,7 +914,7 @@ def compute_confidence(
             draft_tokens=draft_tokens,
             markov_head=markov_head,
             gamma=gamma,
-        )
+        )  # (bs, gemma, markov_rank)
     else:
         markov_embed_stack = None
     confidence_raw = confidence_head(draft_hidden, markov_embed_stack)

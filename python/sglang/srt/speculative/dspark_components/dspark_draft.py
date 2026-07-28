@@ -204,6 +204,8 @@ def sample_draft_block(
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            # step_logits: (bs, vocab_size)
+            # step_idx: int
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             if fast_sampling:
                 exp_noise = torch.empty(
@@ -231,8 +233,8 @@ def sample_draft_block(
         sampler=sampler,
     )
     return DraftBlockResult(
-        draft_tokens=draft_tokens,
-        corrected_logits=corrected_logits,
+        draft_tokens=draft_tokens,  # (bs, gemma)
+        corrected_logits=corrected_logits,  # (bs, gemma, vocab_size)
         greedy_mask=greedy_mask,
         temperatures=temperatures,
     )
@@ -329,7 +331,7 @@ class DraftBlockProposer:
         return DraftProposal(
             draft_block_ids=draft_block_ids,
             draft_block=draft_block,
-            draft_hidden=fwd.draft_hidden_3d,
+            draft_hidden=fwd.draft_hidden_3d,  # (bs, gemma, hidden_size)
             confidence=folded_confidence,
             confidence_tap=confidence_tap,
             folded=folded,

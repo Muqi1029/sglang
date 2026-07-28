@@ -228,7 +228,7 @@ class TargetVerifyExecutor:
         verify_input = DFlashVerifyInput(
             draft_token=verify_ids_2d.reshape(-1),
             positions=positions_2d.reshape(-1),
-            draft_token_num=verify_w,
+            draft_token_num=verify_w,  # gemma + 1
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )

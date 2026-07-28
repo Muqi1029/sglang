@@ -90,6 +90,11 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
+    # 1. compute target probs firstly: (bs, gemma + 1, vocab_size)
+    # candidates: (bs, gemma + 1)
+    # drafte_probs: (bs, gemma, vocab_size)
+    # verify_num_draft_tokens: gemma + 1
+
     if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
@@ -147,9 +152,9 @@ def _accept_sampling_core(
 
 def accept_sampling(
     *,
-    candidates: torch.Tensor,
+    candidates: torch.Tensor,  # (bs, gemma + 1)
     target_logits: torch.Tensor,
-    draft_probs: torch.Tensor,
+    draft_probs: torch.Tensor,  # (bs, gemma, vocab)
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,
@@ -300,9 +305,9 @@ class SoftmaxTemp:
 
 def softmax_temp(
     *,
-    logits: torch.Tensor,
+    logits: torch.Tensor,  # (bs * gemma, vocab_size)
     temperatures: torch.Tensor,
-    rows_per_request: int,
+    rows_per_request: int,  # gemma
 ) -> torch.Tensor:
     num_rows = logits.shape[0]
     bs = num_rows // rows_per_request

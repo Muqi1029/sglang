@@ -571,7 +571,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
-        ).contiguous()
+        ).contiguous()  # (bs, gemma + 1)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -629,7 +629,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
-            verify_ids_2d=verify_ids_2d,
+            verify_ids_2d=verify_ids_2d,  # (bs, gemma + 1)
             target_logits=logits_output.next_token_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,

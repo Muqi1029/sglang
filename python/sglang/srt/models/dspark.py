@@ -39,6 +39,10 @@ def run_markov_block(
     hidden_states: Optional[torch.Tensor],
     sampler: StepSampler,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # base_logits: (bs, gemma, vocab_size)
+    # first_prev_tokens: (bs, ): anchor_tokens
+    # hidden_states: (bs, gemma, hidden_size)
+
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
         empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
@@ -54,13 +58,13 @@ def run_markov_block(
             token_ids=prev_tokens,
             hidden_states=step_hidden,
         )
-        next_tokens = sampler(step_logits, step_idx)
+        next_tokens = sampler(step_logits, step_idx)  # (bs, )
         sampled_tokens.append(next_tokens)
-        corrected_logits.append(step_logits.unsqueeze(1))
+        corrected_logits.append(step_logits.unsqueeze(1))  # (bs, 1, vocab_size)
         prev_tokens = next_tokens
     return (
-        torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1),
+        torch.stack(sampled_tokens, dim=1),  # (bs, gemma)
+        torch.cat(corrected_logits, dim=1),  # (bs, gemma, vocab_size)
     )
 
 
@@ -100,6 +104,7 @@ class VanillaMarkov(nn.Module):
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # logits: (bs, vocab_size)
         return logits + self.compute_step_bias(token_ids, hidden_states)
 
     def apply_block_logits(
@@ -319,11 +324,11 @@ class DSparkConfidenceHead(nn.Module):
             features = torch.cat(
                 [hidden_states, markov_embed_stack.to(dtype=hidden_states.dtype)],
                 dim=-1,
-            )
+            )  # (bs, gemma, hidden_size + markov_rank)
         else:
             features = hidden_states
         features = features.to(dtype=self.proj.weight.dtype)
-        return self.proj(features).squeeze(-1)
+        return self.proj(features).squeeze(-1)  # => (bs, gemma)
 
     def apply_sts(self, confidence_raw: torch.Tensor) -> torch.Tensor:
         self._last_confidence_raw = confidence_raw
