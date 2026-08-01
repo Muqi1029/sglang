@@ -1228,6 +1228,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        spec_tokens_details = {}
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
@@ -1257,6 +1258,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                spec_tokens_details[index] = content["meta_info"].get("", None)
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
@@ -1386,6 +1388,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
+
+            sglext_spec_details = None
+            if request.return_spec_tokens_details and spec_tokens_details:
+                pass
 
             if sglext_routed is not None or sglext_details is not None:
                 sglext_chunk = ChatCompletionStreamResponse(

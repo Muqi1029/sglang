@@ -91,8 +91,8 @@ def _accept_sampling_core(
     bs = candidates.shape[0]
     device = candidates.device
     # 1. compute target probs firstly: (bs, gemma + 1, vocab_size)
-    # candidates: (bs, gemma + 1)
-    # drafte_probs: (bs, gemma, vocab_size)
+    # candidates (anchor tokens + draft tokens): (bs, gemma + 1)
+    # draft_probs: (bs, gemma, vocab_size)
     # verify_num_draft_tokens: gemma + 1
 
     if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:

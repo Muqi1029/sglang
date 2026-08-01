@@ -174,6 +174,13 @@ class CachedTokensDetails(BaseModel):
         return data
 
 
+class SpecTokensDetails(BaseModel):
+    spec_accept_rate: float = 0.0
+    spec_accept_length: float = 0.0
+    spec_correct_drafts_histogram: Optional[List[int]] = None
+    spec_accept_histogram: Optional[List[int]] = None
+
+
 class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
@@ -412,6 +419,7 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    spec_tokens_details: Optional[SpecTokensDetails] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

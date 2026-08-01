@@ -106,12 +106,16 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    NVFP4_W4A8 = "nvfp4_w4a8"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
 
     def is_hpc_ops(self):
         return self == MoeRunnerBackend.HPC_OPS
+
+    def is_nvfp4_w4a8(self):
+        return self == MoeRunnerBackend.NVFP4_W4A8
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM

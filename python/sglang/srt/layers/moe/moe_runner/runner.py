@@ -109,6 +109,19 @@ class MoeRunner:
             # Import here (not at module top, to avoid a circular import) to
             # register the hpc_ops fused func before the pool lookup.
             from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
+        elif runner_backend.is_nvfp4_w4a8():
+            import torch
+
+            major, minor = torch.cuda.get_device_capability()
+            if (major, minor) not in ((8, 9), (9, 0)):
+                raise ValueError(
+                    "--moe-runner-backend nvfp4_w4a8 requires Ada SM89 or "
+                    f"Hopper SM90, got SM{major}{minor}."
+                )
+            self.runner_core = None  # Registered fused standard-dispatch path.
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                nvfp4_w4a8,
+            )
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

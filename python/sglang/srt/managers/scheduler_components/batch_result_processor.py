@@ -565,6 +565,7 @@ class SchedulerBatchResultProcessor:
         result.num_block_accept_tokens = (
             sum(block_accept_lens) if block_accept_lens else 0
         )
+        # the actual verify length
         cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
         result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
 

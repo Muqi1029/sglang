@@ -99,6 +99,7 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     MARLIN = "marlin"
+    NVFP4_W4A8 = "nvfp4_w4a8"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -117,6 +118,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_marlin(self) -> bool:
         return self == Fp4GemmRunnerBackend.MARLIN
+
+    def is_nvfp4_w4a8(self) -> bool:
+        return self == Fp4GemmRunnerBackend.NVFP4_W4A8
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")

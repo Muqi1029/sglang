@@ -89,6 +89,7 @@ class DSparkVerifyPlanner:
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
 
+        # set sts
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
 
         sts_path = server_args.speculative_dspark_confidence_sts_path

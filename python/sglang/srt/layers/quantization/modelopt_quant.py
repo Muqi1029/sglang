@@ -1536,6 +1536,39 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
 
+        if get_fp4_gemm_runner_backend().is_nvfp4_w4a8():
+            if self.quant_config.group_size != 16:
+                raise ValueError(
+                    "nvfp4_w4a8 requires ModelOpt NVFP4 group_size=16, got "
+                    f"{self.quant_config.group_size}."
+                )
+            if layer.input_size_per_partition % 32 != 0:
+                raise ValueError(
+                    "nvfp4_w4a8 requires the per-partition input size to be "
+                    f"divisible by 32, got {layer.input_size_per_partition}."
+                )
+            # Preserve the checkpoint's packed E2M1 and row-major E4M3 scale
+            # tensors.  The W4A8 kernel decodes only the currently used tile.
+            source_scales = layer.weight_scale_2.to(torch.float32)
+            if source_scales.numel() == 1:
+                output_scales = source_scales
+            else:
+                if source_scales.numel() != len(layer.logical_widths):
+                    raise ValueError(
+                        "NVFP4 global-scale count does not match fused Linear "
+                        f"partitions: {source_scales.numel()} vs "
+                        f"{len(layer.logical_widths)}"
+                    )
+                output_scales = torch.cat(
+                    [
+                        source_scales[i].expand(width)
+                        for i, width in enumerate(layer.logical_widths)
+                    ]
+                ).contiguous()
+            copy_or_rebind_param(layer, "weight_global_scale", output_scales)
+            layer.weights_padding_cols = 0
+            return
+
         if get_fp4_gemm_runner_backend().is_marlin():
             if self.quant_config.group_size != 16:
                 raise ValueError(
@@ -1699,6 +1732,21 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if get_fp4_gemm_runner_backend().is_nvfp4_w4a8():
+            from sglang.kernels.ops.quantization.nvfp4_w4a8 import (
+                nvfp4_w4a8_linear,
+            )
+
+            if self.quant_config.is_awq:
+                x = x * layer.pre_quant_scale
+            return nvfp4_w4a8_linear(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                layer.weight_global_scale,
+                bias,
+            )
+
         if get_fp4_gemm_runner_backend().is_marlin():
             return apply_fp4_marlin_linear(
                 input=x,
@@ -1948,7 +1996,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not is_blackwell_supported() and not use_marlin_fallback:
+        use_nvfp4_w4a8 = moe_runner_backend.is_nvfp4_w4a8()
+        if use_nvfp4_w4a8 and is_cuda():
+            capability = get_device_capability()
+            if capability not in ((8, 9), (9, 0)):
+                raise ValueError(
+                    "nvfp4_w4a8 MoE requires Ada SM89 or Hopper SM90, got "
+                    f"SM{capability[0]}{capability[1]}."
+                )
+        if (
+            not is_blackwell_supported()
+            and not use_marlin_fallback
+            and not use_nvfp4_w4a8
+        ):
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
@@ -1973,6 +2033,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe import get_moe_runner_backend
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
+
+    @property
+    def enable_nvfp4_w4a8_moe(self) -> bool:
+        return get_moe_runner_backend().is_nvfp4_w4a8()
 
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
@@ -2082,7 +2146,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self.enable_nvfp4_w4a8_moe:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2102,7 +2166,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self.enable_nvfp4_w4a8_moe:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2185,11 +2249,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             layer._w13_deinterleaved = True
 
-        # GEMM1 scale processing is deferred until the input scale is known;
-        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if moe_runner_backend.is_nvfp4_w4a8():
+            if self.quant_config.group_size != 16:
+                raise ValueError(
+                    "nvfp4_w4a8 MoE requires ModelOpt group_size=16, got "
+                    f"{self.quant_config.group_size}."
+                )
+            if (
+                layer.w13_weight.shape[-1] * 2 % 32 != 0
+                or layer.w2_weight.shape[-1] * 2 % 32 != 0
+            ):
+                raise ValueError("nvfp4_w4a8 MoE requires both GEMM K dims % 32 == 0")
+            for name in ("w13_weight_scale", "w2_weight_scale"):
+                scale = getattr(layer, name)
+                if scale.dtype != torch.float8_e4m3fn:
+                    raise TypeError(f"{name} must use float8_e4m3fn")
+            # The custom runner consumes raw row-major block scales and ignores
+            # checkpoint activation scales in favor of dynamic per-token FP8.
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+            return
+
+        # GEMM1 scale processing is deferred until the input scale is known;
+        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -2555,6 +2639,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_nvfp4_w4a8():
+            from sglang.srt.layers.moe.moe_runner.nvfp4_w4a8 import (
+                Nvfp4W4A8MoeQuantInfo,
+            )
+
+            quant_info = Nvfp4W4A8MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale,
+                w2_weight_scale=layer.w2_weight_scale,
+                w13_weight_global_scale=layer.w13_weight_scale_2,
+                w2_weight_global_scale=layer.w2_weight_scale_2,
+            )
             return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path

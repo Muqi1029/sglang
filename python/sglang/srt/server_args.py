@@ -260,6 +260,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "nvfp4_w4a8",  # Packed ModelOpt NVFP4 weights + dynamic per-token FP8 activations (SM89/SM90)
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -299,6 +300,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_trtllm",
     "marlin",
+    "nvfp4_w4a8",
 ]
 
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
@@ -1697,7 +1699,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+), 'nvfp4_w4a8' (packed E2M1 weights with dynamic per-token FP8 activations on SM89/SM90). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
         ),
@@ -6396,6 +6398,16 @@ class ServerArgs:
                 "nvfp4_online",
                 None,
             ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+
+        if view.moe_runner_backend == "nvfp4_w4a8":
+            assert view.quantization == "modelopt_fp4", (
+                "nvfp4_w4a8 requires --quantization modelopt_fp4, got "
+                f"{view.quantization!r}."
+            )
+            assert view.moe_a2a_backend == "none", (
+                "nvfp4_w4a8 currently supports only --moe-a2a-backend none, got "
+                f"{view.moe_a2a_backend!r}."
+            )
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),

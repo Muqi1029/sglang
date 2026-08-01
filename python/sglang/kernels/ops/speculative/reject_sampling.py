@@ -39,8 +39,10 @@ def speculative_sampling_classic_kernel(
     idx_ptr_base = RetriveIndex + pid * stride_idx_b  # retrive_index[pid]
     uni_ptr_base = UniformSamples + pid * stride_uni_b  # uniform_samples[pid]
 
+    accept_idx_ptr_base = AcceptIndex + pid * stride_idx_b
+
     root_global_idx = tl.load(idx_ptr_base + 0 * stride_idx_s)
-    tl.store(AcceptIndex + pid * stride_idx_b + 0 * stride_idx_s, root_global_idx)
+    tl.store(accept_idx_ptr_base + 0 * stride_idx_s, root_global_idx)
     last_accepted_global_idx = root_global_idx
 
     num_accept = 0
@@ -49,18 +51,17 @@ def speculative_sampling_classic_kernel(
     step = 1
     continue_verifying = 1
 
+    dp_row_start = pid * stride_dp_b
+    tp_row_start = pid * stride_tp_b
+
     while (step < NUM_SLOTS) and (continue_verifying == 1):
         draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
 
         offset_prob = (
-            (pid * stride_tp_b)
-            + (cur_prob_row * stride_tp_s)
-            + (draft_token * stride_tp_v)
+            tp_row_start + (cur_prob_row * stride_tp_s) + (draft_token * stride_tp_v)
         )
         offset_draft = (
-            (pid * stride_dp_b)
-            + (cur_prob_row * stride_dp_s)
-            + (draft_token * stride_dp_v)
+            dp_row_start + (cur_prob_row * stride_dp_s) + (draft_token * stride_dp_v)
         )
 
         p = tl.load(TargetProbs + offset_prob)
@@ -71,11 +72,13 @@ def speculative_sampling_classic_kernel(
         if coin * q < p:
             num_accept += 1
             cur_prob_row = step
+
+            # store the draft token into predict
             tl.store(Predicts + last_accepted_global_idx, draft_token)
 
             curr_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
             tl.store(
-                AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
+                accept_idx_ptr_base + num_accept * stride_idx_s,
                 curr_global_idx,
             )
             last_accepted_global_idx = curr_global_idx

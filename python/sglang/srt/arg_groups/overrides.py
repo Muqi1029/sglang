@@ -2066,6 +2066,11 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
+    if runner == "nvfp4_w4a8":
+        logger.warning(
+            "NVFP4-W4A8 MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
     return {}
 
 

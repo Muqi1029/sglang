@@ -533,7 +533,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
-        draft_tokens = draft_block.draft_tokens
+        draft_tokens = draft_block.draft_tokens  # (bs, gemma)
 
         confidence = proposal.confidence
         if confidence is None:
