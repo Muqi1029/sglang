@@ -202,6 +202,9 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
+        output_sizes: Logical output sizes packed into this replicated linear.
+                      Quantized fused linears use one per-tensor scale for each
+                      logical output matrix.
         prefix: The name of the layer in the state dict, including all parents
                         (e.g. model.layers.0.qkv_proj)
     """
@@ -215,6 +218,7 @@ class ReplicatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        output_sizes: Optional[List[int]] = None,
     ):
         super().__init__(
             input_size,
@@ -228,10 +232,18 @@ class ReplicatedLinear(LinearBase):
         # All the linear layer supports quant method.
         assert self.quant_method is not None
         self.with_bias = bias
+        if output_sizes is None:
+            output_sizes = [self.output_size]
+        if sum(output_sizes) != self.output_size:
+            raise ValueError(
+                "ReplicatedLinear output_sizes must sum to output_size, got "
+                f"{output_sizes} and {self.output_size}."
+            )
+        self.output_partition_sizes = output_sizes
         self.quant_method.create_weights(
             self,
             self.input_size,
-            [self.output_size],
+            self.output_partition_sizes,
             self.input_size,
             self.output_size,
             self.params_dtype,

@@ -5,6 +5,8 @@ import torch
 from sglang.kernels.ops.quantization.nvfp4_w4a8 import (
     dequantize_nvfp4_reference,
 )
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
@@ -15,6 +17,24 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDeepseekWeightLoader(CustomTestCase):
+    def test_replicated_nvfp4_linear_preserves_logical_output_partitions(self):
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=[],
+        )
+        layer = ReplicatedLinear(
+            input_size=32,
+            output_size=48,
+            bias=False,
+            quant_config=quant_config,
+            output_sizes=[32, 16],
+        )
+
+        self.assertEqual(layer.logical_widths, [32, 16])
+        self.assertEqual(tuple(layer.input_scale.shape), (2,))
+        self.assertEqual(tuple(layer.weight_scale_2.shape), (2,))
+
     def test_load_fused_indexer_nvfp4_tensors_in_arbitrary_order(self):
         prefix = "model.layers.0.self_attn.indexer"
         fused_name = f"{prefix}.wk_weights_proj.weight"

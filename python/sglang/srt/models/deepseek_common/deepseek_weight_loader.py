@@ -424,16 +424,13 @@ class DeepseekV2WeightLoaderMixin:
                                 if q_a_proj_weight.shape == torch.Size(
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    # Fused ModelOpt linears retain one global
-                                    # NVFP4 weight scale per logical output
-                                    # partition.  Do not collapse independently
-                                    # quantized q_a / kv_a scales to q_a's value.
-                                    if name.endswith(".weight_scale_2"):
-                                        fused_weight = torch.stack(
-                                            [q_a_proj_weight, kv_a_proj_weight]
-                                        )
-                                    else:
-                                        fused_weight = q_a_proj_weight
+                                    # Retain one scalar for each logical output
+                                    # partition. In particular, independently
+                                    # quantized q_a / kv_a NVFP4 matrices have
+                                    # different weight_scale_2 values.
+                                    fused_weight = torch.stack(
+                                        [q_a_proj_weight, kv_a_proj_weight]
+                                    )
                                 else:
                                     cat_dim = 0
                                     if self.quant_config is not None and (
