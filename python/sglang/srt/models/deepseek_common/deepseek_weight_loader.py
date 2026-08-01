@@ -15,7 +15,7 @@
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -81,12 +81,17 @@ def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: Dict[str, torch.Tensor],
-    pending: Dict[str, Dict[str, torch.Tensor]],
+    pending: Dict[str, Dict[str, Any]],
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
-    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
-    weights_proj the bottom n_heads rows.
+    """Load indexer wk / weights_proj into the fused BF16 wk_weights_proj.
+
+    ``wk`` fills the top ``head_dim`` rows and ``weights_proj`` fills the bottom
+    ``n_heads`` rows.  Quantized checkpoint tensors are reconstructed before
+    they are copied because the DSA fusion deliberately owns one BF16 Linear:
+
+    * block-FP8: ``weight`` + ``weight_scale_inv``;
+    * ModelOpt NVFP4: packed ``weight`` + ``weight_scale`` + ``weight_scale_2``.
 
     Returns False when there is no fused param (non-CUDA, or CUDA with
     SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
@@ -97,29 +102,84 @@ def _load_fused_indexer_wk(
     if fused_param is None or fused_param.dtype != torch.bfloat16:
         return False
 
-    if ".indexer.weights_proj." in name:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[-w.shape[0] :].copy_(w)
-        return True
+    component = "weights_proj" if ".indexer.weights_proj." in name else "wk"
 
-    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
-    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[: w.shape[0]].copy_(w)
+    def copy_component(weight: torch.Tensor) -> None:
+        weight = weight.to(device=fused_param.device, dtype=torch.bfloat16)
+        if component == "weights_proj":
+            fused_param.data[-weight.shape[0] :].copy_(weight)
+        else:
+            fused_param.data[: weight.shape[0]].copy_(weight)
+
+    # The W4A8 backend quantizes activations dynamically, so the serialized
+    # ModelOpt input scale is intentionally not used by this fused BF16 layer.
+    if name.endswith(".input_scale"):
         return True
 
     entry = pending.setdefault(fused_name, {})
-    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-        loaded_weight
-    )
-    if "weight" in entry and "scale" in entry:
-        pending.pop(fused_name)
-        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
+    component_entry = entry.setdefault(component, {})
+
+    if name.endswith(".weight_scale_2"):
+        component_entry["nvfp4_global_scale"] = _clone_if_runai_streamed_tensor(
+            loaded_weight
         )
-        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+    elif name.endswith(".weight_scale"):
+        component_entry["nvfp4_block_scale"] = _clone_if_runai_streamed_tensor(
+            loaded_weight
+        )
+    elif name.endswith(".weight_scale_inv"):
+        component_entry["fp8_scale"] = _clone_if_runai_streamed_tensor(loaded_weight)
+    elif name.endswith(".weight"):
+        weight = _clone_if_runai_streamed_tensor(loaded_weight)
+        if weight.dtype == torch.uint8:
+            component_entry["nvfp4_weight"] = weight
+        elif weight.dtype == torch.float8_e4m3fn:
+            component_entry["fp8_weight"] = weight
+        else:
+            copy_component(weight)
+            entry.pop(component, None)
+            if not entry:
+                pending.pop(fused_name, None)
+            return True
+    else:
+        entry.pop(component, None)
+        if not entry:
+            pending.pop(fused_name, None)
+        return False
+
+    nvfp4_keys = {"nvfp4_weight", "nvfp4_block_scale", "nvfp4_global_scale"}
+    if nvfp4_keys.issubset(component_entry):
+        from sglang.kernels.ops.quantization.nvfp4_w4a8 import (
+            dequantize_nvfp4_reference,
+        )
+
+        packed_weight = component_entry["nvfp4_weight"]
+        block_scale = component_entry["nvfp4_block_scale"].to(
+            device=packed_weight.device
+        )
+        global_scale = component_entry["nvfp4_global_scale"].to(
+            device=packed_weight.device
+        )
+        weight_bf16 = dequantize_nvfp4_reference(
+            packed_weight,
+            block_scale,
+            global_scale,
+            dtype=torch.bfloat16,
+        )
+        copy_component(weight_bf16)
+        entry.pop(component, None)
+    elif {"fp8_weight", "fp8_scale"}.issubset(component_entry):
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        weight_bf16 = block_quant_dequant(
+            component_entry["fp8_weight"],
+            component_entry["fp8_scale"],
+            block_size,
+            torch.bfloat16,
+        )
+        copy_component(weight_bf16)
+        entry.pop(component, None)
+    if not entry:
+        pending.pop(fused_name, None)
     return True
 
 
@@ -194,7 +254,7 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
-        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+        pending_indexer_wk: Dict[str, Dict[str, Any]] = {}
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -364,7 +424,16 @@ class DeepseekV2WeightLoaderMixin:
                                 if q_a_proj_weight.shape == torch.Size(
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    fused_weight = q_a_proj_weight
+                                    # Fused ModelOpt linears retain one global
+                                    # NVFP4 weight scale per logical output
+                                    # partition.  Do not collapse independently
+                                    # quantized q_a / kv_a scales to q_a's value.
+                                    if name.endswith(".weight_scale_2"):
+                                        fused_weight = torch.stack(
+                                            [q_a_proj_weight, kv_a_proj_weight]
+                                        )
+                                    else:
+                                        fused_weight = q_a_proj_weight
                                 else:
                                     cat_dim = 0
                                     if self.quant_config is not None and (
@@ -522,6 +591,31 @@ class DeepseekV2WeightLoaderMixin:
                     )
             else:
                 w = self_attn.kv_b_proj.weight
+
+            # ModelOpt NVFP4 stores kv_b_proj packed, but MLA decode consumes
+            # derived w_kc / w_vc tensors rather than running this projection as
+            # a regular Linear.  Reconstruct BF16 for that one-time split while
+            # leaving the packed parameter resident for paths that still call
+            # kv_b_proj directly.
+            if w.dtype == torch.uint8:
+                from sglang.kernels.ops.quantization.nvfp4_w4a8 import (
+                    dequantize_nvfp4_reference,
+                )
+
+                if not (
+                    hasattr(self_attn.kv_b_proj, "weight_scale")
+                    and hasattr(self_attn.kv_b_proj, "weight_scale_2")
+                ):
+                    raise ValueError(
+                        "Packed NVFP4 kv_b_proj requires weight_scale and "
+                        "weight_scale_2"
+                    )
+                w = dequantize_nvfp4_reference(
+                    w,
+                    self_attn.kv_b_proj.weight_scale,
+                    self_attn.kv_b_proj.weight_scale_2,
+                    dtype=torch.bfloat16,
+                )
 
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
             # This may affect the accuracy of fp8 model.
