@@ -70,9 +70,16 @@ static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
 static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
+template <
+    typename TileShape,
+    typename ClusterShape,
+    typename KernelSchedule,
+    typename EpilogueSchedule,
+    int GroupSize_ = 128>
 struct cutlass_3x_w4a8_group_gemm {
-  static constexpr int GroupSize = 128;
+  static constexpr int GroupSize = GroupSize_;
+  static_assert(GroupSize == 32 || GroupSize == 128, "W4A8 supports group sizes 32 and 128");
+  static_assert(get<2>(TileShape{}) % GroupSize == 0, "TileShape K must be divisible by the scale group size");
   static constexpr int PackedScalesNum = get<2>(TileShape{}) / GroupSize;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
 
@@ -139,8 +146,8 @@ struct cutlass_3x_w4a8_group_gemm {
  * @param b_tensors Tensor containing all B matrices (int4 packed as int8) with
  * shape [E, N, K/2]
  * @param a_scales Tensor containing A matrix scale factors
- * @param b_scales Tensor containing B matrix scale factors with shape [E,
- * K//512, N*4]
+ * @param b_scales Tensor containing interleaved B matrix scale factors. Four
+ * consecutive K-group scales are packed together for each output channel.
  * @param expert_offsets Tensor containing expert offsets for determining group
  * boundaries (int32)
  * @param problem_sizes Tensor containing problem sizes with shape [num_experts,
@@ -149,7 +156,7 @@ struct cutlass_3x_w4a8_group_gemm {
  * @param b_strides Stride information for B tensors
  * @param d_strides Stride information for D tensors
  * @param s_strides Stride information for scale tensors
- * @param chunk_size Size of each chunk for scales (K / number of scale chunks)
+ * @param chunk_size Number of consecutive K weights sharing one scale
  */
 // template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
 template <typename Gemm>
@@ -235,7 +242,8 @@ void cutlass_w4a8_group_gemm_caller(
       b_tensors,
       d_tensors,
       a_scales,
-      b_scales);
+      b_scales,
+      Gemm::GroupSize);
 
   arguments = Args{
       cutlass::gemm::GemmUniversalMode::kGrouped,

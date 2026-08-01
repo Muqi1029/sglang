@@ -64,6 +64,7 @@ def cutlass_w4a8_moe(
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
     routed_scaling_factor: float = 1.0,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -80,10 +81,10 @@ def cutlass_w4a8_moe(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-        Shape: [num_experts, K // 512, N * 8]
-    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
-        Shape: [num_experts, N // 512, K * 4]
+    - w1_scale (torch.Tensor): The BF16 group scale to dequantize w1_q.
+        It is interleaved in groups of four along K.
+    - w2_scale (torch.Tensor): The BF16 group scale to dequantize w2_q.
+        It is interleaved in groups of four along K.
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - topk_ids (torch.Tensor): The ids of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
@@ -101,6 +102,7 @@ def cutlass_w4a8_moe(
         Shape: scalar or [1, N]
     - apply_router_weight_on_input (bool): When true, the topk weights are
         applied directly on the inputs. This is only applicable when topk is 1.
+    - group_size (int): Number of consecutive K weights sharing one scale.
 
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
@@ -113,6 +115,13 @@ def cutlass_w4a8_moe(
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
+    assert group_size in (32, 128), f"unsupported W4A8 group_size={group_size}"
+    assert w1_scale.numel() == w1_q.shape[0] * w1_q.shape[1] * (
+        w1_q.shape[2] * 2 // group_size
+    ), "w1 scale shape does not match group_size"
+    assert w2_scale.numel() == w2_q.shape[0] * w2_q.shape[1] * (
+        w2_q.shape[2] * 2 // group_size
+    ), "w2 scale shape does not match group_size"
 
     assert a_strides1.shape[0] == w1_q.shape[0], "A Strides 1 expert number mismatch"
     assert b_strides1.shape[0] == w1_q.shape[0], "B Strides 1 expert number mismatch"
@@ -190,7 +199,7 @@ def cutlass_w4a8_moe(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
 
@@ -220,7 +229,7 @@ def cutlass_w4a8_moe(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
 

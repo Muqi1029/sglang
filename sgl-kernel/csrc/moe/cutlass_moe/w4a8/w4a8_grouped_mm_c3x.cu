@@ -13,7 +13,7 @@ namespace {
 
 enum class Sched { PP, CO };
 
-template <int M, int N, int K, int A, int B, int C, Sched S>
+template <int M, int N, int K, int A, int B, int C, Sched S, int GroupSize = 128>
 struct SM90W4A8Config {
   using KernelSchedule = std::conditional_t<
       S == Sched::PP,
@@ -27,7 +27,8 @@ struct SM90W4A8Config {
 
   using TileShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>;
   using ClusterShape = cute::Shape<cute::Int<A>, cute::Int<B>, cute::Int<C>>;
-  using Cutlass3xW4A8Gemm = cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>;
+  using Cutlass3xW4A8Gemm =
+      cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule, GroupSize>;
 };
 
 template <int M, int N, int K, int A, int B, int C>
@@ -35,6 +36,12 @@ using SM90_PP = SM90W4A8Config<M, N, K, A, B, C, Sched::PP>;
 
 template <int M, int N, int K, int A, int B, int C>
 using SM90_CO = SM90W4A8Config<M, N, K, A, B, C, Sched::CO>;
+
+template <int M, int N, int K, int A, int B, int C>
+using SM90_PP_G32 = SM90W4A8Config<M, N, K, A, B, C, Sched::PP, 32>;
+
+template <int M, int N, int K, int A, int B, int C>
+using SM90_CO_G32 = SM90W4A8Config<M, N, K, A, B, C, Sched::CO, 32>;
 
 template <typename Config>
 inline void invoke_gemm(
@@ -85,6 +92,55 @@ inline void invoke_gemm(
       chunk_size)
 #define INVOKE_GEMM_WITH_CONFIG(Config) INVOKE_GEMM_WITH_CONFIG_HELPER Config
 
+void dispatch_w4a8_moe_mm_sm90_group32(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t chunk_size,
+    int64_t topk) {
+  uint32_t const m = a_tensors.size(0) / topk;
+  uint32_t const n = d_tensors.size(1);
+  uint32_t const k = a_tensors.size(1);
+
+  TORCH_CHECK(k % 128 == 0, "group-32 W4A8 requires K divisible by 128, got ", k);
+
+  // A TileK of 128 packs exactly four group-32 BF16 scales into the existing
+  // 64-bit CUTLASS lookup-table converter.  The down projection has a much
+  // larger N and a short K, so favor the latency-oriented ping-pong schedule.
+  if (n >= 4096 && k <= 512) {
+    if (m <= 8) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP_G32<64, 16, 128, 1, 1, 1>));
+    } else if (m <= 32) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP_G32<128, 32, 128, 1, 1, 1>));
+    } else if (m <= 512) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP_G32<128, 32, 128, 2, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP_G32<128, 64, 128, 1, 1, 1>));
+    }
+  } else {
+    // Gate/up projection.  These shapes include GLM-5.2 TP8 (N=512,K=6144).
+    if (m <= 4) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_PP_G32<64, 32, 128, 2, 1, 1>));
+    } else if (m <= 32) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO_G32<128, 16, 128, 2, 1, 1>));
+    } else if (m <= 256) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO_G32<128, 16, 128, 1, 1, 1>));
+    } else if (m <= 1024) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO_G32<128, 32, 128, 1, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO_G32<128, 64, 128, 1, 1, 1>));
+    }
+  }
+}
+
 void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor& d_tensors,
     torch::Tensor const& a_tensors,
@@ -99,6 +155,25 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk) {
+  if (chunk_size == 32) {
+    dispatch_w4a8_moe_mm_sm90_group32(
+        d_tensors,
+        a_tensors,
+        b_tensors,
+        a_scales,
+        b_scales,
+        expert_offsets,
+        problem_sizes,
+        a_strides,
+        b_strides,
+        d_strides,
+        s_strides,
+        chunk_size,
+        topk);
+    return;
+  }
+  TORCH_CHECK(chunk_size == 128, "W4A8 supports group sizes 32 and 128, got ", chunk_size);
+
   uint32_t const m = a_tensors.size(0) / topk;
   uint32_t const n = d_tensors.size(1);
   uint32_t const k = a_tensors.size(1);

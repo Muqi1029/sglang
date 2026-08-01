@@ -22,6 +22,7 @@ __global__ void int4_fp8_get_group_gemm_starts(
     cutlass::bfloat16_t* b_scales_base_as_int,
     int64_t n,
     int64_t k,
+    int64_t group_size,
     bool per_act_token,
     bool per_out_ch) {
   int expert_id = threadIdx.x;
@@ -31,7 +32,7 @@ __global__ void int4_fp8_get_group_gemm_starts(
   b_offsets[expert_id] = b_base_as_int + expert_id * k * n / 2;
   out_offsets[expert_id] = out_base_as_int + expert_offset * n;
   a_scales_offsets[expert_id] = a_scales_base_as_int + (per_act_token ? expert_offset : 0);
-  b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * k / 128 : expert_id);
+  b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * k / group_size : expert_id);
 }
 
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator>
@@ -49,6 +50,7 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
     int64_t n,
     int64_t m,
     int64_t k,
+    int64_t group_size,
     bool per_act_token,
     bool per_out_ch,
     int num_experts) {
@@ -59,7 +61,7 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
   int64_t b_offset = expert_id * k * n / 2;
   int64_t out_offset = expert_id * m * n;
   int64_t a_scales_offset = 0;
-  int64_t b_scales_offset = per_out_ch ? expert_id * n * 4 * k / 512 : expert_id;
+  int64_t b_scales_offset = per_out_ch ? expert_id * n * k / group_size : expert_id;
 
   a_offsets[expert_id] = a_base_as_int + a_offset;
   b_offsets[expert_id] = b_base_as_int + b_offset;
@@ -85,6 +87,7 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
             static_cast<cutlass::bfloat16_t*>(b_scales.data_ptr()),                       \
             out_tensors.size(1),                                                          \
             a_tensors.size(1),                                                            \
+            group_size,                                                                   \
             per_act_token,                                                                \
             per_out_ch);                                                                  \
   }
@@ -106,6 +109,7 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
             out_tensors.size(2),                                                             \
             a_tensors.size(1),                                                               \
             a_tensors.size(2),                                                               \
+            group_size,                                                                      \
             per_act_token,                                                                   \
             per_out_ch,                                                                      \
             num_experts);                                                                    \
@@ -124,11 +128,13 @@ void run_int4_fp8_get_group_gemm_starts(
     torch::Tensor const& b_tensors,
     torch::Tensor& out_tensors,
     torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales) {
+    torch::Tensor const& b_scales,
+    int64_t group_size) {
   TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(b_tensors.dtype() == torch::kInt8);
   TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
   TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
+  TORCH_CHECK(group_size == 32 || group_size == 128, "W4A8 group_size must be 32 or 128");
 
   int num_experts = static_cast<int>(expert_offsets.size(0));
   bool per_act_token = a_scales.numel() != 1;

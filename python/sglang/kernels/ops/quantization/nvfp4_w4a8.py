@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVFP4-weight / FP8-activation GEMM kernels for Ada and Hopper.
 
-The kernels in this module deliberately keep the ModelOpt checkpoint layout in
+The dense path and the Ada MoE fallback keep the ModelOpt checkpoint layout in
 device memory: two E2M1 values per byte, one E4M3 scale per 16 weights, and an
-FP32 outer scale.  A weight tile is expanded to E4M3 only in registers before
-an FP8 tensor-core dot product; no persistent FP8 copy of the weight is made.
+FP32 outer scale.  Hopper's performance-first MoE path instead requantizes the
+same allocation in place to signed INT4/group-32 during loading so the existing
+CUTLASS FP8 x INT4 WGMMA kernel can consume it.  Both representations retain
+4-bit weight storage and avoid a persistent FP8 weight copy.
 
 Hopper/Ada do not have an FP4 tensor-core instruction.  Two adjacent NVFP4
 groups are therefore normalized to a common scale and represented as an FP8
@@ -23,7 +25,15 @@ import triton
 import triton.language as tl
 
 NVFP4_GROUP_SIZE = 16
+CUTLASS_W4A8_GROUP_SIZE = 32
 _FP8_DOT_K = 32
+# E2M1 has a maximum magnitude of 6 while E4M3 can represent 448.  Use a
+# power-of-two boost before the E4M3 cast so small block-scale ratios do not
+# underflow; compensate exactly in the post-MMA scale.  64 keeps 6 * 64 = 384
+# below the finite E4M3 maximum.
+_NVFP4_TO_FP8_BOOST = 64.0
+_JIT_CUTLASS_W4A8_GROUP_SIZE = tl.constexpr(CUTLASS_W4A8_GROUP_SIZE)
+_JIT_NVFP4_TO_FP8_BOOST = tl.constexpr(_NVFP4_TO_FP8_BOOST)
 
 
 def _check_supported_device(tensor: torch.Tensor) -> None:
@@ -37,12 +47,319 @@ def _check_supported_device(tensor: torch.Tensor) -> None:
         )
 
 
-def nvfp4_w4a8_moe_block_size(tensor: torch.Tensor) -> int:
-    """Routing alignment used by the architecture-specific FP8 MMA tile."""
+def nvfp4_w4a8_moe_block_size(
+    tensor: torch.Tensor, routes_per_expert: Optional[float] = None
+) -> int:
+    """Choose route padding without forcing sparse decode experts to M=64."""
     _check_supported_device(tensor)
     major, _ = torch.cuda.get_device_capability(tensor.device)
-    # Hopper FP8 uses an m64 WGMMA tile.  Ada uses m16 FP8 mma.sync.
-    return 64 if major == 9 else 16
+    if major != 9 or routes_per_expert is None:
+        return 16
+    if routes_per_expert <= 16:
+        return 16
+    if routes_per_expert <= 32:
+        return 32
+    return 64
+
+
+def repack_nvfp4_for_w4a8(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder NVFP4 storage for coalesced KxN tensor-core tile loads.
+
+    The logical checkpoint shapes remain ``[..., N, K/2]`` and
+    ``[..., N, K/16]``.  Only the physical strides change from N-major to
+    K-major, analogous to Marlin's one-time weight repack.  Keeping the
+    logical shape unchanged also keeps weight inspection and the portable
+    dequantization helper working without a backend-specific code path.
+    """
+    if weight.dtype != torch.uint8 or weight.ndim not in (2, 3):
+        raise TypeError("NVFP4 weight must be a 2-D or 3-D packed uint8 tensor")
+    if weight_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError("NVFP4 block scale must use float8_e4m3fn")
+    if weight_scale.ndim != weight.ndim:
+        raise ValueError("NVFP4 weight and scale ranks must match")
+    if weight.shape[:-1] != weight_scale.shape[:-1]:
+        raise ValueError("NVFP4 weight and scale output dimensions must match")
+    if weight.shape[-1] * 2 != weight_scale.shape[-1] * NVFP4_GROUP_SIZE:
+        raise ValueError("NVFP4 packed weight and block-scale K dimensions mismatch")
+
+    # Transpose-copy-transpose returns the original logical shape backed by a
+    # K-major allocation (N has stride 1).  It does not retain a second copy.
+    weight_k_major = weight.transpose(-1, -2).contiguous().transpose(-1, -2)
+    scale_k_major = weight_scale.transpose(-1, -2).contiguous().transpose(-1, -2)
+    return weight_k_major, scale_k_major
+
+
+@triton.jit
+def _decode_e2m1(code):
+    magnitude_code = code & 0x7
+    magnitude = tl.where(
+        magnitude_code == 0,
+        0.0,
+        tl.where(
+            magnitude_code == 1,
+            0.5,
+            tl.where(
+                magnitude_code == 2,
+                1.0,
+                tl.where(
+                    magnitude_code == 3,
+                    1.5,
+                    tl.where(
+                        magnitude_code == 4,
+                        2.0,
+                        tl.where(
+                            magnitude_code == 5,
+                            3.0,
+                            tl.where(magnitude_code == 6, 4.0, 6.0),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return tl.where((code & 0x8) != 0, -magnitude, magnitude)
+
+
+@triton.jit
+def _round_symmetric_int4(value, scale):
+    magnitude = tl.floor(tl.abs(value) / scale + 0.5)
+    signed = tl.where(value < 0.0, -magnitude, magnitude)
+    return tl.maximum(-7.0, tl.minimum(7.0, signed)).to(tl.int32)
+
+
+@triton.jit
+def _nvfp4_to_cutlass_int4_kernel(
+    weight_ptr,
+    weight_scale_ptr,
+    weight_global_scale_ptr,
+    cutlass_scale_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    weight_stride_e,
+    weight_stride_n,
+    weight_stride_k,
+    scale_stride_e,
+    scale_stride_n,
+    scale_stride_k,
+    global_scale_stride_e,
+    global_scale_stride_s,
+    GLOBAL_SCALE_SHARDS: tl.constexpr,
+    NUM_ROWS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """In-place E2M1/group16 -> signed INT4/group32 conversion for CUTLASS."""
+    pid = tl.program_id(0)
+    groups_per_row = K // _JIT_CUTLASS_W4A8_GROUP_SIZE
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = rows < NUM_ROWS
+    expert = rows // N
+    out_channel = rows % N
+
+    packed_offsets = tl.arange(0, _JIT_CUTLASS_W4A8_GROUP_SIZE // 2)
+    global_scale_shard = out_channel // (N // GLOBAL_SCALE_SHARDS)
+    global_scale = tl.load(
+        weight_global_scale_ptr
+        + expert * global_scale_stride_e
+        + global_scale_shard * global_scale_stride_s,
+        mask=row_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    # One program converts several complete rows.  This keeps the launch count
+    # small for GLM-5.2 (hundreds of experts) while preserving coalesced 16-byte
+    # group accesses and race-free in-place writes.
+    for group in tl.range(0, groups_per_row):
+        packed_ptrs = (
+            weight_ptr
+            + expert[:, None] * weight_stride_e
+            + out_channel[:, None] * weight_stride_n
+            + (group * (_JIT_CUTLASS_W4A8_GROUP_SIZE // 2) + packed_offsets[None, :])
+            * weight_stride_k
+        )
+        packed = tl.load(packed_ptrs, mask=row_mask[:, None], other=0).to(tl.int32)
+        low_code = packed & 0xF
+        high_code = (packed >> 4) & 0xF
+
+        # The first eight packed bytes belong to the first group16 scale and
+        # the remaining eight to the second.  Fold ModelOpt's outer scale into
+        # the CUTLASS dequant scale, leaving one BF16 lookup in the GEMM.
+        block_scale0 = tl.load(
+            weight_scale_ptr
+            + expert * scale_stride_e
+            + out_channel * scale_stride_n
+            + (group * 2) * scale_stride_k,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+        block_scale1 = tl.load(
+            weight_scale_ptr
+            + expert * scale_stride_e
+            + out_channel * scale_stride_n
+            + (group * 2 + 1) * scale_stride_k,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+        block_scale = tl.where(
+            packed_offsets[None, :] < 8,
+            block_scale0[:, None],
+            block_scale1[:, None],
+        )
+
+        low = _decode_e2m1(low_code) * block_scale * global_scale[:, None]
+        high = _decode_e2m1(high_code) * block_scale * global_scale[:, None]
+        max_abs = tl.maximum(tl.max(tl.abs(low), axis=1), tl.max(tl.abs(high), axis=1))
+        dequant_scale = max_abs / 7.0
+        safe_scale = tl.where(max_abs > 0.0, dequant_scale, 1.0)
+
+        low_q = _round_symmetric_int4(low, safe_scale[:, None])
+        high_q = _round_symmetric_int4(high, safe_scale[:, None])
+        packed_q = (low_q & 0xF) | ((high_q & 0xF) << 4)
+        tl.store(packed_ptrs, packed_q, mask=row_mask[:, None])
+
+        # interleave_scales layout: [E, groups/4, N*4].  Four adjacent K
+        # groups form one 64-bit scale element used by the CUTLASS LUT.
+        scale_offset = (
+            expert * (groups_per_row * N)
+            + (group // 4) * (N * 4)
+            + out_channel * 4
+            + group % 4
+        )
+        tl.store(
+            cutlass_scale_ptr + scale_offset,
+            dequant_scale,
+            mask=row_mask,
+        )
+
+
+def prepare_nvfp4_for_cutlass_w4a8(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare ModelOpt NVFP4 weights for the SM90 CUTLASS W4A8 kernel.
+
+    Two group-16 E2M1 blocks are requantized into one signed-INT4 group-32
+    block.  The packed weight is converted in place; the returned BF16 scale
+    tensor occupies exactly as many bytes as the original E4M3 group-16 scale.
+    """
+    _check_supported_device(weight)
+    if torch.cuda.get_device_capability(weight.device)[0] != 9:
+        raise ValueError("CUTLASS NVFP4-W4A8 preparation requires SM90")
+    if weight.dtype != torch.uint8 or weight.ndim != 3:
+        raise TypeError("CUTLASS NVFP4-W4A8 expects W[E,N,K/2] uint8")
+    if weight_scale.dtype != torch.float8_e4m3fn or weight_scale.ndim != 3:
+        raise TypeError("CUTLASS NVFP4-W4A8 expects S[E,N,K/16] E4M3")
+
+    experts, n, packed_k = weight.shape
+    k = packed_k * 2
+    groups = k // CUTLASS_W4A8_GROUP_SIZE
+    if k % (CUTLASS_W4A8_GROUP_SIZE * 4) != 0:
+        raise ValueError(
+            "CUTLASS NVFP4-W4A8 requires K divisible by 128 for scale "
+            f"interleaving, got K={k}"
+        )
+    if tuple(weight_scale.shape) != (experts, n, k // NVFP4_GROUP_SIZE):
+        raise ValueError(
+            "NVFP4 scale shape mismatch: expected "
+            f"{(experts, n, k // NVFP4_GROUP_SIZE)}, got {tuple(weight_scale.shape)}"
+        )
+
+    global_scale = weight_global_scale.to(torch.float32).contiguous()
+    if global_scale.ndim == 1:
+        global_scale = global_scale.view(experts, 1)
+    if global_scale.ndim != 2 or global_scale.shape[0] != experts:
+        raise ValueError(
+            f"invalid NVFP4 global scale shape {tuple(global_scale.shape)}"
+        )
+    if global_scale.shape[1] not in (1, 2):
+        raise ValueError("NVFP4 global scale must have one value, or gate/up values")
+    if global_scale.shape[1] == 2 and n % 2:
+        raise ValueError("gate/up global scales require an even output dimension")
+
+    # ModelOpt tensors normally arrive contiguous.  Keep an explicit guard so
+    # the in-place write can never mutate a strided view with aliased elements.
+    packed_weight = weight.contiguous()
+    source_scale = weight_scale.contiguous()
+    cutlass_scale = torch.empty(
+        (experts, groups // 4, n * 4),
+        device=weight.device,
+        dtype=torch.bfloat16,
+    )
+    block_rows = 8
+    grid = (triton.cdiv(experts * n, block_rows),)
+    _nvfp4_to_cutlass_int4_kernel[grid](
+        packed_weight,
+        source_scale,
+        global_scale,
+        cutlass_scale,
+        n,
+        k,
+        packed_weight.stride(0),
+        packed_weight.stride(1),
+        packed_weight.stride(2),
+        source_scale.stride(0),
+        source_scale.stride(1),
+        source_scale.stride(2),
+        global_scale.stride(0),
+        global_scale.stride(1),
+        GLOBAL_SCALE_SHARDS=global_scale.shape[1],
+        NUM_ROWS=experts * n,
+        BLOCK_ROWS=block_rows,
+        num_warps=4,
+    )
+    return packed_weight.view(torch.int8), cutlass_scale
+
+
+def requantize_nvfp4_to_int4_reference(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable reference for the group16 E2M1 -> group32 INT4 conversion."""
+    if weight.ndim != 3 or weight.dtype != torch.uint8:
+        raise TypeError("reference conversion expects W[E,N,K/2] uint8")
+    experts, n, packed_k = weight.shape
+    k = packed_k * 2
+    if k % (CUTLASS_W4A8_GROUP_SIZE * 4) != 0:
+        raise ValueError("reference conversion requires K divisible by 128")
+
+    low = weight & 0xF
+    high = (weight >> 4) & 0xF
+    codes = torch.stack((low, high), dim=-1).flatten(-2)
+    table = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=weight.device,
+        dtype=torch.float32,
+    )
+    values = table[(codes & 0x7).long()]
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    values = values * weight_scale.float().repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)
+
+    global_scale = weight_global_scale.float()
+    if global_scale.ndim == 1:
+        global_scale = global_scale.view(experts, 1)
+    if global_scale.shape[1] == 2:
+        global_scale = global_scale.repeat_interleave(n // 2, dim=1)
+    values = values * global_scale.unsqueeze(-1)
+
+    groups = k // CUTLASS_W4A8_GROUP_SIZE
+    values = values.reshape(experts, n, groups, CUTLASS_W4A8_GROUP_SIZE)
+    scales = values.abs().amax(dim=-1) / 7.0
+    safe_scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    quant = torch.round(values / safe_scales.unsqueeze(-1)).clamp(-7, 7).to(torch.int8)
+    low_q = quant[..., 0::2].to(torch.int16) & 0xF
+    high_q = (quant[..., 1::2].to(torch.int16) & 0xF) << 4
+    packed = (low_q | high_q).to(torch.int8).flatten(-2).contiguous()
+    interleaved = (
+        scales.to(torch.bfloat16)
+        .reshape(experts, n, groups // 4, 4)
+        .permute(0, 2, 1, 3)
+        .reshape(experts, groups // 4, n * 4)
+        .contiguous()
+    )
+    return packed, interleaved
 
 
 @triton.jit
@@ -130,8 +447,10 @@ def _load_normalized_nvfp4_k32(
         scale0[None, :],
         scale1[None, :],
     )
-    weight_fp8 = (fp4 * element_scale / safe_scale[None, :]).to(tl.float8e4nv)
-    return weight_fp8, common_scale
+    weight_fp8 = (
+        fp4 * element_scale / safe_scale[None, :] * _JIT_NVFP4_TO_FP8_BOOST
+    ).to(tl.float8e4nv)
+    return weight_fp8, common_scale / _JIT_NVFP4_TO_FP8_BOOST
 
 
 @triton.jit
@@ -258,8 +577,11 @@ def nvfp4_w4a8_linear(
     x_fp8, x_scale = sglang_per_token_quant_fp8(x_2d)
     out = torch.empty((m, n), device=x.device, dtype=x.dtype)
     major, _ = torch.cuda.get_device_capability(x.device)
-    block_m = 64 if major == 9 else (16 if m <= 32 else 32)
-    block_n = 64
+    block_m = 16 if m <= 32 else (64 if major == 9 else 32)
+    # Marlin's small-M path uses an N=128 thread tile.  It amortizes route and
+    # scale handling while retaining enough independent N tiles for the GLM
+    # projection sizes.  Fall back to N=64 for larger M to control registers.
+    block_n = 128 if m <= 16 and n >= 128 else 64
     block_k = 64
     _nvfp4_w4a8_gemm_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, block_n))](
         x_fp8,
@@ -426,6 +748,9 @@ def nvfp4_w4a8_grouped_gemm(
     *,
     top_k: int,
     mul_routed_weight: bool,
+    block_m: int,
+    input_scale: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Grouped NVFP4-W4A8 GEMM over already aligned MoE route ids."""
     _check_supported_device(a)
@@ -433,7 +758,17 @@ def nvfp4_w4a8_grouped_gemm(
         raise ValueError(
             "grouped NVFP4-W4A8 expects " "A[rows,K], W[E,N,K/2], S[E,N,K/16]"
         )
-    if a.dtype not in (torch.bfloat16, torch.float16):
+    is_prequantized = input_scale is not None
+    if is_prequantized:
+        if a.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "prequantized grouped nvfp4_w4a8 input must use float8_e4m3fn"
+            )
+        if output_dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                "prequantized grouped GEMM requires a BF16/FP16 output_dtype"
+            )
+    elif a.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"grouped nvfp4_w4a8 input must be BF16/FP16, got {a.dtype}")
     if weight.dtype != torch.uint8 or weight_scale.dtype != torch.float8_e4m3fn:
         raise TypeError("grouped NVFP4-W4A8 expects uint8 weights and E4M3 scales")
@@ -459,14 +794,44 @@ def nvfp4_w4a8_grouped_gemm(
     if global_scale.shape[1] == 2 and n % 2:
         raise ValueError("gate/up global scales require an even output dimension")
     if routes == 0:
-        return a.new_empty((0, n))
+        return torch.empty((0, n), device=a.device, dtype=output_dtype or a.dtype)
 
-    from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
+    if block_m not in (16, 32, 64):
+        raise ValueError(f"unsupported nvfp4_w4a8 MoE block_m={block_m}")
+    if sorted_token_ids.shape[0] % block_m != 0:
+        raise ValueError(
+            "sorted route storage is not aligned to the requested block_m: "
+            f"{sorted_token_ids.shape[0]} vs {block_m}"
+        )
+    expected_expert_blocks = sorted_token_ids.shape[0] // block_m
+    if expert_ids.numel() < expected_expert_blocks:
+        raise ValueError(
+            "expert_ids was produced with a different MoE block size: "
+            f"need {expected_expert_blocks}, got {expert_ids.numel()}"
+        )
 
-    a_fp8, a_scale = sglang_per_token_quant_fp8(a.contiguous())
-    out = torch.empty((routes * top_k, n), device=a.device, dtype=a.dtype)
-    block_m = nvfp4_w4a8_moe_block_size(a)
-    block_n = 64
+    if is_prequantized:
+        a_fp8 = a.contiguous()
+        a_scale = input_scale
+        if a_scale.numel() != routes:
+            raise ValueError(
+                "expected one FP8 scale per input row "
+                f"({routes}), got {a_scale.numel()}"
+            )
+        a_scale = a_scale.reshape(routes, 1).contiguous()
+        result_dtype = output_dtype
+    else:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_quant_fp8,
+        )
+
+        a_fp8, a_scale = sglang_per_token_quant_fp8(a.contiguous())
+        result_dtype = a.dtype
+    out = torch.empty((routes * top_k, n), device=a.device, dtype=result_dtype)
+    # Decode is dominated by many very small expert groups.  N=128 mirrors
+    # Marlin's small-batch tile and halves program/metadata overhead for both
+    # GLM-5.2 expert GEMMs (N=512 and N=6144 under TP8).
+    block_n = 128 if block_m == 16 and n >= 128 else 64
     block_k = 64
     grid = (triton.cdiv(sorted_token_ids.shape[0], block_m) * triton.cdiv(n, block_n),)
     _nvfp4_w4a8_grouped_gemm_kernel[grid](
@@ -534,9 +899,13 @@ def dequantize_nvfp4_reference(
 
 
 __all__ = [
+    "CUTLASS_W4A8_GROUP_SIZE",
     "NVFP4_GROUP_SIZE",
     "dequantize_nvfp4_reference",
     "nvfp4_w4a8_grouped_gemm",
     "nvfp4_w4a8_linear",
     "nvfp4_w4a8_moe_block_size",
+    "prepare_nvfp4_for_cutlass_w4a8",
+    "repack_nvfp4_for_w4a8",
+    "requantize_nvfp4_to_int4_reference",
 ]
