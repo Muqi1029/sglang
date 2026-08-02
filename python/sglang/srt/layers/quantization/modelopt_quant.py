@@ -2265,7 +2265,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         if moe_runner_backend.is_nvfp4_w4a8():
             from sglang.kernels.ops.quantization.nvfp4_w4a8 import (
-                prepare_nvfp4_for_cutlass_w4a8,
                 repack_nvfp4_for_w4a8,
             )
 
@@ -2286,71 +2285,33 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             major, _ = torch.cuda.get_device_capability(layer.w13_weight.device)
             if major == 9:
                 logger.warning_once(
-                    "SM90 nvfp4_w4a8 uses the performance-first CUTLASS path: "
-                    "ModelOpt E2M1 group-16 expert weights are requantized to "
-                    "signed INT4 group-32 during loading. This keeps 4-bit "
-                    "weight memory but may affect model accuracy."
+                    "SM90 nvfp4_w4a8 uses the native Marlin schedule with "
+                    "FP8 activations and the m16n8k32 E4M3 warp-MMA PTX shape. "
+                    "NVFP4 weights remain packed at 4 bits in the original "
+                    "group-16 format."
                 )
-                # Hopper uses the existing CUTLASS FP8 x INT4 WGMMA kernel.
-                # Requantize two E2M1 group-16 blocks into one signed-INT4
-                # group-32 block.  The outer ModelOpt scale is folded into the
-                # BF16 group scale, whose byte size equals the old E4M3 scale.
-                w13_weight, w13_scale = prepare_nvfp4_for_cutlass_w4a8(
-                    layer.w13_weight.data,
-                    layer.w13_weight_scale.data,
-                    layer.w13_weight_scale_2.data,
-                )
-                w2_weight, w2_scale = prepare_nvfp4_for_cutlass_w4a8(
-                    layer.w2_weight.data,
-                    layer.w2_weight_scale.data,
-                    layer.w2_weight_scale_2.data,
-                )
-
-                from sglang.srt.layers.moe.moe_runner.nvfp4_w4a8 import (
-                    Nvfp4W4A8CutlassMetadata,
-                )
-
-                num_experts = w13_weight.shape[0]
-                hidden_size = w13_weight.shape[2] * 2
-                intermediate_size = w2_weight.shape[2] * 2
-                device = w13_weight.device
-                a_strides1 = torch.full(
-                    (num_experts, 3), hidden_size, device=device, dtype=torch.int64
-                )
-                c_strides1 = torch.full(
-                    (num_experts, 3),
-                    2 * intermediate_size,
-                    device=device,
-                    dtype=torch.int64,
-                )
-                a_strides2 = torch.full(
-                    (num_experts, 3),
-                    intermediate_size,
-                    device=device,
-                    dtype=torch.int64,
-                )
-                c_strides2 = torch.full(
-                    (num_experts, 3), hidden_size, device=device, dtype=torch.int64
-                )
-                self._nvfp4_w4a8_cutlass_metadata = Nvfp4W4A8CutlassMetadata(
-                    a_strides1=a_strides1,
-                    b_strides1=a_strides1,
-                    c_strides1=c_strides1,
-                    a_strides2=a_strides2,
-                    b_strides2=a_strides2,
-                    c_strides2=c_strides2,
-                    s_strides13=c_strides1,
-                    s_strides2=c_strides2,
-                    expert_offsets=torch.empty(
-                        num_experts + 1, device=device, dtype=torch.int32
-                    ),
-                    problem_sizes1=torch.empty(
-                        (num_experts, 3), device=device, dtype=torch.int32
-                    ),
-                    problem_sizes2=torch.empty(
-                        (num_experts, 3), device=device, dtype=torch.int32
-                    ),
-                )
+                if (
+                    layer.moe_runner_config.is_gated
+                    and layer.w13_weight_scale_2.dim() == 2
+                    and layer.w13_weight_scale_2.shape[1] >= 2
+                ):
+                    if not torch.allclose(
+                        layer.w13_weight_scale_2[:, 0],
+                        layer.w13_weight_scale_2[:, 1],
+                    ):
+                        logger.warning_once(
+                            "Native Marlin uses one outer scale for the fused "
+                            "gate/up projection; using the gate scale."
+                        )
+                    copy_or_rebind_param(
+                        layer,
+                        "w13_weight_scale_2",
+                        layer.w13_weight_scale_2[:, 0].contiguous(),
+                    )
+                prepare_moe_nvfp4_layer_for_marlin(layer)
+                self._nvfp4_w4a8_marlin_fp8 = True
+                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+                return
             else:
                 # Ada is a correctness fallback.  Keep native E2M1/group-16
                 # storage and only repack strides for the Triton implementation.
@@ -2360,14 +2321,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_weight, w2_scale = repack_nvfp4_for_w4a8(
                     layer.w2_weight.data, layer.w2_weight_scale.data
                 )
-                self._nvfp4_w4a8_cutlass_metadata = None
+                self._nvfp4_w4a8_marlin_fp8 = False
             layer.w13_weight = Parameter(w13_weight, requires_grad=False)
             layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
-            # Both backends ignore checkpoint activation scales in favor of
-            # dynamic FP8: CUTLASS on Hopper and the native-E2M1 Triton fallback
-            # on Ada.
+            # Ada keeps the native-E2M1 Triton correctness fallback.
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
             return
 
@@ -2752,7 +2711,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_weight_scale=layer.w2_weight_scale,
                 w13_weight_global_scale=layer.w13_weight_scale_2,
                 w2_weight_global_scale=layer.w2_weight_scale_2,
-                cutlass_metadata=getattr(self, "_nvfp4_w4a8_cutlass_metadata", None),
+                workspace=getattr(layer, "workspace", None),
+                marlin_fp8=getattr(self, "_nvfp4_w4a8_marlin_fp8", False),
             )
             return self.runner.run(dispatch_output, quant_info)
 

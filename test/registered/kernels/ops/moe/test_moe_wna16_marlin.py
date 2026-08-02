@@ -684,5 +684,92 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 
+@pytest.mark.parametrize("mul_topk_weights", [False, True])
+def test_moe_wna16_marlin_nvfp4_w4a8_matches_quantized_reference(
+    mul_topk_weights,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() not in ((8, 9), (9, 0)):
+        pytest.skip("native Marlin W4A8 requires SM89 or SM90")
+
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_quant_fp8,
+    )
+
+    torch.manual_seed(41)
+    m, n, k, e = 3, 128, 128, 1
+    dtype = torch.bfloat16
+    packed, scales, global_scale, weight_ref = make_nvfp4_weight_and_ref(
+        n, k, dtype, group_size=16
+    )
+
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=16)
+    layer.moe_runner_config = SimpleNamespace(is_gated=False)
+    layer.params_dtype = dtype
+    layer.intermediate_size_per_partition = n
+    layer.w13_weight = torch.nn.Parameter(packed.unsqueeze(0), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(packed.unsqueeze(0), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        scales.unsqueeze(0), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(scales.unsqueeze(0), requires_grad=False)
+    layer.w13_weight_scale_2 = torch.nn.Parameter(
+        global_scale.reshape(1), requires_grad=False
+    )
+    layer.w2_weight_scale_2 = torch.nn.Parameter(
+        global_scale.reshape(1), requires_grad=False
+    )
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+
+    activation = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    activation_fp8, activation_scale = sglang_per_token_quant_fp8(
+        activation.contiguous()
+    )
+    topk_ids = torch.zeros((m, 1), device="cuda", dtype=torch.int32)
+    topk_weights = torch.tensor(
+        [[0.6], [0.8], [1.0]], device="cuda", dtype=torch.float32
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, 16, e
+    )
+    output = torch.zeros((m, n), device="cuda", dtype=dtype)
+
+    actual = moe_wna16_marlin_gemm(
+        activation_fp8,
+        output,
+        layer.w13_weight,
+        None,
+        layer.w13_weight_scale,
+        layer.w13_weight_scale_2,
+        None,
+        None,
+        None,
+        layer.workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=16,
+        top_k=1,
+        mul_topk_weights=mul_topk_weights,
+        is_ep=False,
+        b_q_type=scalar_types.float4_e2m1f,
+        size_m=m,
+        size_n=n,
+        size_k=k,
+        use_atomic_add=torch.cuda.get_device_capability()[0] >= 9,
+        use_fp32_reduce=True,
+        input_scale=activation_scale,
+        output_dtype=dtype,
+    )
+
+    expected = (activation_fp8.float() * activation_scale) @ weight_ref.float().T
+    if mul_topk_weights:
+        expected *= topk_weights
+    torch.testing.assert_close(actual, expected.to(dtype), rtol=0.12, atol=0.12)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

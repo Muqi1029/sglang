@@ -5,13 +5,14 @@
 #include "../marlin/marlin_dtypes.cuh"
 
 #define MARLIN_KERNEL_PARAMS                                                                                         \
-  const int4 *__restrict__ A, const int4 *__restrict__ B, int4 *__restrict__ C, int4 *__restrict__ C_tmp,            \
-      const int4 *__restrict__ b_bias_ptr, const int4 *__restrict__ scales_ptr,                                      \
-      const uint16_t *__restrict__ scale2_ptr, const int4 *__restrict__ zp_ptr, const int *__restrict__ g_idx,       \
-      const int32_t *__restrict__ sorted_token_ids_ptr, const int32_t *__restrict__ expert_ids_ptr,                  \
-      const int32_t *__restrict__ num_tokens_past_padded_ptr, const float *__restrict__ topk_weights_ptr, int top_k, \
-      bool mul_topk_weights, bool is_ep, int num_groups, int prob_m, int prob_n, int prob_k, int *locks,             \
-      bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
+  const int4 *__restrict__ A, const float *__restrict__ a_scales_ptr, const int4 *__restrict__ B,                    \
+      int4 *__restrict__ C, int4 *__restrict__ C_tmp, const int4 *__restrict__ b_bias_ptr,                           \
+      const int4 *__restrict__ scales_ptr, const uint16_t *__restrict__ scale2_ptr, const int4 *__restrict__ zp_ptr, \
+      const int *__restrict__ g_idx, const int32_t *__restrict__ sorted_token_ids_ptr,                               \
+      const int32_t *__restrict__ expert_ids_ptr, const int32_t *__restrict__ num_tokens_past_padded_ptr,            \
+      const float *__restrict__ topk_weights_ptr, int top_k, bool mul_topk_weights, bool is_ep, int num_groups,      \
+      int prob_m, int prob_n, int prob_k, int *locks, bool has_bias, bool use_atomic_add, bool use_fp32_reduce,      \
+      int max_shared_mem
 
 namespace device::marlin_moe {
 template <
@@ -31,6 +32,7 @@ template <
     const int group_blocks,              // number of consecutive 16x16 blocks
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
+    const bool kActFp8,                  // FP8 activation with a per-token scale
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias                  // has per-expert bias
     >

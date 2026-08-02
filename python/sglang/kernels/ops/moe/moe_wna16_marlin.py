@@ -67,14 +67,44 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    input_scale: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     device = a.device
+    act_fp8 = a.dtype == torch.float8_e4m3fn
+    if act_fp8:
+        if input_scale is None or input_scale.numel() != size_m:
+            raise ValueError("FP8 Marlin requires one input scale per input row")
+        if b_bias_or_none is not None:
+            raise ValueError("FP8 Marlin does not currently support expert bias")
+        if input_scale.dtype != torch.float32:
+            raise TypeError("FP8 Marlin input_scale must use float32")
+        if input_scale.device != device:
+            raise ValueError("FP8 Marlin input_scale must be on the input device")
+        major, minor = torch.cuda.get_device_capability(device)
+        if (major, minor) < (8, 9):
+            raise RuntimeError("FP8 Marlin requires CUDA compute capability 8.9+")
+        if c_or_none is None and output_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("FP8 Marlin requires an FP16/BF16 output_dtype")
+        if c_or_none is not None and c_or_none.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("FP8 Marlin requires an FP16/BF16 output tensor")
+    elif input_scale is not None:
+        raise ValueError("input_scale is only valid for FP8 Marlin activations")
+
+    compute_dtype = (
+        c_or_none.dtype
+        if c_or_none is not None
+        else (output_dtype if act_fp8 else a.dtype)
+    )
 
     # Allocate output if not provided
     if c_or_none is not None:
         c = c_or_none
     else:
-        c = torch.empty((size_m * top_k, size_n), dtype=a.dtype, device=device)
+        c = torch.empty((size_m * top_k, size_n), dtype=compute_dtype, device=device)
 
     # Early return for zero-size M
     if size_m == 0:
@@ -132,13 +162,19 @@ def moe_wna16_marlin_gemm(
     # Convert Optional tensors to empty tensors
     g_idx_t = _or_empty(g_idx_or_none, device, torch.int32)
     perm_t = _or_empty(perm_or_none, device, torch.int32)
-    b_zeros_t = _or_empty(b_zeros_or_none, device, a.dtype)
-    b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
-    global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
+    b_zeros_t = _or_empty(b_zeros_or_none, device, compute_dtype)
+    b_bias_t = _or_empty(b_bias_or_none, device, compute_dtype)
+    global_scale_t = _or_empty(global_scale_or_none, device, compute_dtype)
+    input_scale_t = (
+        input_scale.reshape(size_m, 1).contiguous()
+        if input_scale is not None
+        else _or_empty(None, device, torch.float32)
+    )
 
-    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
+    module = _jit_moe_wna16_marlin_module(compute_dtype, is_ep, has_bias)
     module.moe_wna16_marlin_gemm(
         a,
+        input_scale_t,
         c,
         b_q_weight,
         b_bias_t,
@@ -171,6 +207,7 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        act_fp8,
     )
 
     return c

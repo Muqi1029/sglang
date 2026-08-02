@@ -204,7 +204,8 @@ int get_kernel_cache_size(
     bool has_act_order,
     bool is_k_full,
     int has_zp,
-    int is_zp_float) {
+    int is_zp_float,
+    bool act_fp8) {
   int pack_factor = 32 / num_bits;
 
   // Get B size
@@ -215,7 +216,7 @@ int get_kernel_cache_size(
   // shm size for block_sorted_ids/rd_block_sorted_ids/block_topk_weights
   // both of them requires tb_m * 4 bytes (tb_m * int32 or tb_m * float32)
   int sh_block_meta_size = tb_m * 4;
-  int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
+  int sh_a_size = pipe_stages * (tb_m * tb_k) * (act_fp8 ? 1 : 2);
   int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 4;
   int sh_red_size = tb_m * (tb_n + 8) * 2;
   int sh_bias_size = tb_n * 2;
@@ -253,6 +254,7 @@ bool is_valid_config(
     bool is_k_full,
     int has_zp,
     int is_zp_float,
+    bool act_fp8,
     int max_shared_mem) {
   // Sanity
   if (th_config.thread_k == -1 || th_config.thread_n == -1 || th_config.num_threads == -1) {
@@ -287,7 +289,8 @@ bool is_valid_config(
       has_act_order,
       is_k_full,
       has_zp,
-      is_zp_float);
+      is_zp_float,
+      act_fp8);
   return cache_size + kSharedMemoryValidityMargin <= max_shared_mem;
 }
 
@@ -296,7 +299,7 @@ bool is_valid_config(
   else if (                                                                                                            \
       q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS &&                  \
       thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS &&        \
-      num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \
+      num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT && !act_fp8) {                                          \
     constexpr auto S_TYPE = W_TYPE == host::kFE2M1f                                                                    \
                                 ? (GROUP_BLOCKS == 1 ? host::kFE4M3fn : host::kFE8M0fnu)                               \
                                 : (std::is_same<scalar_t, half>::value ? host::kFloat16 : host::kBFloat16);            \
@@ -312,8 +315,31 @@ bool is_valid_config(
         pipe_stages,                                                                                                   \
         GROUP_BLOCKS,                                                                                                  \
         IS_ZP_FLOAT,                                                                                                   \
+        false,                                                                                                         \
         kIsEP,                                                                                                         \
         kHasBias>;                                                                                                     \
+  }
+
+#define FP8_NVFP4_GET_IF(N_BLOCKS, K_BLOCKS, NUM_THREADS)                                                  \
+  else if (                                                                                                \
+      act_fp8 && q_type == host::kFE2M1f && thread_m_blocks == 1 && thread_n_blocks == N_BLOCKS &&         \
+      thread_k_blocks == K_BLOCKS && !m_block_size_8 && group_blocks == 1 && num_threads == NUM_THREADS && \
+      !is_zp_float) {                                                                                      \
+    kernel = Marlin<                                                                                       \
+        scalar_t,                                                                                          \
+        host::kFE2M1f.id(),                                                                                \
+        host::kFE4M3fn.id(),                                                                               \
+        NUM_THREADS,                                                                                       \
+        1,                                                                                                 \
+        N_BLOCKS,                                                                                          \
+        K_BLOCKS,                                                                                          \
+        false,                                                                                             \
+        pipe_stages,                                                                                       \
+        1,                                                                                                 \
+        false,                                                                                             \
+        true,                                                                                              \
+        kIsEP,                                                                                             \
+        kHasBias>;                                                                                         \
   }
 
 // COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
@@ -448,11 +474,18 @@ MarlinFuncPtr get_marlin_kernel(
     bool has_zp,
     int group_blocks,
     int num_threads,
-    bool is_zp_float) {
+    bool is_zp_float,
+    bool act_fp8) {
   int num_bits = q_type.size_bits();
   auto kernel = MarlinDefault;
   if (false) {
   }
+
+#if SGL_CUDA_ARCH >= 890
+  // The 256-thread K128 specialization exceeds 160 registers/thread on SM90
+  // and collapses to one CTA/SM. K64 keeps three resident CTAs on Hopper.
+  FP8_NVFP4_GET_IF(8, 4, 128)
+#endif
 
   COMMON_GET_IF(host::kU4)
   COMMON_GET_IF(host::kU4B8)
@@ -488,6 +521,7 @@ exec_config_t determine_exec_config(
     bool is_k_full,
     bool has_zp,
     bool is_zp_float,
+    bool act_fp8,
     int max_shared_mem,
     int sms) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
@@ -513,6 +547,7 @@ exec_config_t determine_exec_config(
             is_k_full,
             has_zp,
             is_zp_float,
+            act_fp8,
             max_shared_mem)) {
       continue;
     }
@@ -529,7 +564,8 @@ exec_config_t determine_exec_config(
         has_act_order,
         is_k_full,
         has_zp,
-        is_zp_float);
+        is_zp_float,
+        act_fp8);
 
     int group_blocks = 0;
     if (!has_act_order) {
@@ -546,7 +582,8 @@ exec_config_t determine_exec_config(
         has_zp,
         group_blocks,
         th_config.num_threads,
-        is_zp_float);
+        is_zp_float,
+        act_fp8);
 
     if (kernel == MarlinDefault) continue;
 
@@ -577,6 +614,7 @@ exec_config_t determine_exec_config(
 template <typename scalar_t, bool kIsEP, bool kHasBias>
 void marlin_mm(
     const void* A,
+    const void* a_scales,
     const void* B,
     void* C,
     void* C_tmp,
@@ -613,9 +651,16 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    bool act_fp8) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
+  if (act_fp8) {
+    host::RuntimeCheck(moe_block_size == 16, "FP8 Marlin requires moe_block_size=16");
+    host::RuntimeCheck(!has_act_order, "FP8 Marlin does not support act-order weights");
+    host::RuntimeCheck(!has_bias, "FP8 Marlin does not currently support expert bias");
+    host::RuntimeCheck(q_type == host::kFE2M1f, "FP8 Marlin currently requires NVFP4 weights");
+  }
 
   if (has_zp) {
     host::RuntimeCheck(
@@ -654,6 +699,7 @@ void marlin_mm(
 
   int num_bits = q_type.size_bits();
   const int4* A_ptr = (const int4*)A;
+  const float* a_scales_ptr = (const float*)a_scales;
   const int4* B_ptr = (const int4*)B;
   int4* C_ptr = (int4*)C;
   int4* C_tmp_ptr = (int4*)C_tmp;
@@ -728,6 +774,7 @@ void marlin_mm(
         is_k_full,
         has_zp,
         is_zp_float,
+        act_fp8,
         max_shared_mem,
         sms);
     thread_tfg = exec_cfg.tb_cfg;
@@ -756,6 +803,7 @@ void marlin_mm(
           is_k_full,
           has_zp,
           is_zp_float,
+          act_fp8,
           max_shared_mem),
       "Invalid thread config: thread_m_blocks = ",
       thread_m_blocks,
@@ -796,7 +844,8 @@ void marlin_mm(
       has_zp,
       group_blocks,
       num_threads,
-      is_zp_float);
+      is_zp_float,
+      act_fp8);
 
   if (kernel == MarlinDefault) {
     host::Panic(
@@ -826,7 +875,7 @@ void marlin_mm(
   host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem));
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
+      A_ptr, a_scales_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
@@ -840,6 +889,7 @@ void marlin_mm(
 template <typename scalar_t, bool kIsEP, bool kHasBias>
 void moe_wna16_marlin_gemm(
     tvm::ffi::TensorView a,
+    tvm::ffi::TensorView a_scales,
     tvm::ffi::TensorView c,
     tvm::ffi::TensorView b_q_weight,
     tvm::ffi::TensorView b_bias,
@@ -871,7 +921,8 @@ void moe_wna16_marlin_gemm(
     int64_t group_size,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    bool act_fp8) {
   using namespace host;
 
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
@@ -916,7 +967,14 @@ void moe_wna16_marlin_gemm(
   // Verify device and strides
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
-  TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(a);
+  if (act_fp8) {
+    TensorMatcher({-1, -1}).with_dtype<fp8_e4m3_t>().with_device(device).verify(a);
+    TensorMatcher({-1, -1}).with_dtype<float>().with_device(device).verify(a_scales);
+    RuntimeCheck(a_scales.numel() == size_m, "FP8 Marlin expects one activation scale per input row");
+  } else {
+    TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(a);
+    RuntimeCheck(a_scales.numel() == 0, "activation scales are only valid for FP8 Marlin");
+  }
 
   device.verify(b_q_weight.device());
   RuntimeCheck(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
@@ -1076,6 +1134,7 @@ void moe_wna16_marlin_gemm(
 
   device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias>(
       a.data_ptr(),
+      a_scales.data_ptr(),
       b_q_weight.data_ptr(),
       c.data_ptr(),
       c_tmp.data_ptr(),
@@ -1112,5 +1171,6 @@ void moe_wna16_marlin_gemm(
       sms,
       use_atomic_add,
       use_fp32_reduce,
-      is_zp_float);
+      is_zp_float,
+      act_fp8);
 }

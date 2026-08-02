@@ -3,10 +3,9 @@
 
 The dense path and the Ada MoE fallback keep the ModelOpt checkpoint layout in
 device memory: two E2M1 values per byte, one E4M3 scale per 16 weights, and an
-FP32 outer scale.  Hopper's performance-first MoE path instead requantizes the
-same allocation in place to signed INT4/group-32 during loading so the existing
-CUTLASS FP8 x INT4 WGMMA kernel can consume it.  Both representations retain
-4-bit weight storage and avoid a persistent FP8 weight copy.
+FP32 outer scale. Hopper MoE uses the native CUDA Marlin implementation in
+``moe_wna16_marlin`` with the same packed NVFP4 representation; this module
+remains the dense/Ada fallback.
 
 Hopper/Ada do not have an FP4 tensor-core instruction.  Two adjacent NVFP4
 groups are therefore normalized to a common scale and represented as an FP8

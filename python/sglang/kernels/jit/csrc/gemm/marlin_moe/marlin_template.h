@@ -52,11 +52,13 @@ template <
     const int group_blocks,              // number of consecutive 16x16 blocks
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
+    const bool kActFp8,                  // FP8 activation with a per-token scale
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias                  // has per-expert bias
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
+    const float* __restrict__ a_scales_ptr,                  // FP8 per-token scales
     const int4* __restrict__ B,                              // 4bit quantized weight matrix of shape kxn
     int4* __restrict__ C,                                    // fp16 output buffer of shape mxn
     int4* __restrict__ C_tmp,                                // fp32 tmp output buffer (for reduce)
@@ -110,6 +112,41 @@ mma(const typename ScalarType<scalar_t>::FragA& a_frag,
   } else {
     STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t);
   }
+}
+
+using Fp8HalfFragA = Vec<uint32_t, 2>;
+using Fp8FragA = Vec<uint32_t, 4>;
+using Fp8FragB = Vec<uint32_t, 2>;
+
+// Pair Marlin's K16 sub-iterations into the FP8 K32 warp-MMA PTX shape while
+// preserving the original tile schedule and reduction machinery. Ada lowers
+// this to native QMMA; Hopper accepts the PTX shape but lowers legacy warp MMA
+// differently from its native warp-group WGMMA path.
+__device__ inline void mma_fp8(const Fp8FragA& frag_a, const Fp8FragB& frag_b, Vec<float, 4>& frag_c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+  const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
+  const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
+  float* c = reinterpret_cast<float*>(&frag_c);
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+      : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+  (void)frag_a;
+  (void)frag_b;
+  (void)frag_c;
+#endif
+}
+
+template <typename scalar_t>
+__device__ inline uint32_t pack_fp8_frag_b(const typename ScalarType<scalar_t>::FragB& frag_b) {
+  const scalar_t* values = reinterpret_cast<const scalar_t*>(&frag_b);
+  fp8x2_e4m3_t lo =
+      fp8x2_e4m3_t{make_float2(ScalarType<scalar_t>::num2float(values[0]), ScalarType<scalar_t>::num2float(values[1]))};
+  fp8x2_e4m3_t hi =
+      fp8x2_e4m3_t{make_float2(ScalarType<scalar_t>::num2float(values[2]), ScalarType<scalar_t>::num2float(values[3]))};
+  return static_cast<uint32_t>(lo.__x) | (static_cast<uint32_t>(hi.__x) << 16);
 }
 
 template <typename scalar_t>
@@ -174,6 +211,15 @@ __device__ inline void ldsm(typename ScalarType<scalar_t>::FragA& frag_a, const 
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
+}
+
+// Load one K16 half of an FP8 m16n8k32 A fragment.  Two consecutive Marlin
+// register buffers are concatenated before issuing the MMA.
+__device__ inline void ldsm_fp8_half(Fp8HalfFragA& frag_a, const void* smem_ptr) {
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(frag_a[0]), "=r"(frag_a[1])
+               : "r"(smem));
 }
 
 // Multiply dequantized values by the corresponding quantization scale; used
@@ -295,14 +341,16 @@ template <
     const int group_blocks,              // number of consecutive 16x16 blocks
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
+    const bool kActFp8,                  // FP8 activation with a per-token scale
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias                  // has per-expert bias
     >
 __global__ void Marlin(
-    const int4* __restrict__ A,  // fp16 input matrix of shape mxk
-    const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
-    int4* __restrict__ C,        // fp16 output buffer of shape mxn
-    int4* __restrict__ C_tmp,    // fp32 tmp output buffer (for reduce)
+    const int4* __restrict__ A,              // fp16/bf16 or packed FP8 input matrix
+    const float* __restrict__ a_scales_ptr,  // FP8 per-token scales
+    const int4* __restrict__ B,              // 4bit quantized weight matrix of shape kxn
+    int4* __restrict__ C,                    // fp16 output buffer of shape mxn
+    int4* __restrict__ C_tmp,                // fp32 tmp output buffer (for reduce)
     const int4* __restrict__ b_bias_ptr,
     const int4* __restrict__ scales_ptr,                     // fp16 quantization scales of shape
                                                              // (k/groupsize)xn
@@ -345,6 +393,7 @@ __global__ void Marlin(
   using FragC = typename ScalarType<scalar_t>::FragC;
   using FragS = typename ScalarType<scalar_t>::FragS;
   using FragZP = typename ScalarType<scalar_t>::FragZP;
+  using InputFragA = std::conditional_t<kActFp8, Fp8HalfFragA, FragA>;
 
   extern __shared__ int4 sh[];
   static constexpr auto w_type = host::ScalarType::from_id(w_type_id);
@@ -355,6 +404,11 @@ __global__ void Marlin(
     static_assert(s_type == host::kBFloat16);
   } else if constexpr (std::is_same<scalar_t, half>::value) {
     static_assert(s_type == host::kFloat16);
+  }
+  if constexpr (kActFp8) {
+    static_assert(w_type == host::kFE2M1f && s_type == host::kFE4M3fn);
+    static_assert(!m_block_size_8, "FP8 Marlin requires an M block of at least 16");
+    static_assert(group_blocks == 1, "FP8 Marlin currently supports NVFP4 group-16 weights");
   }
 
   constexpr bool has_zp = w_type == host::kU4 || w_type == host::kU8;
@@ -493,11 +547,17 @@ __global__ void Marlin(
       int idx = sh_block_sorted_ids[threadIdx.x];
       sh_rd_block_sorted_ids[threadIdx.x] = idx / top_k;
 
-      if (mul_topk_weights) {
+      if (mul_topk_weights || kActFp8) {
         idx = idx < prob_m_top_k ? idx : 0;
-        scalar_t topk_weight_tmp = Dtype::float2num(topk_weights_ptr[idx]);
+        float row_scale = kActFp8 ? a_scales_ptr[idx / top_k] : 1.0f;
+        if (mul_topk_weights) row_scale *= topk_weights_ptr[idx];
+        scalar_t topk_weight_tmp = Dtype::float2num(row_scale);
         if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-          sh_block_topk_weights[threadIdx.x] = __hmul2(global_scale, Dtype::num2num2(topk_weight_tmp));
+          if (mul_topk_weights) {
+            sh_block_topk_weights[threadIdx.x] = __hmul2(global_scale, Dtype::num2num2(topk_weight_tmp));
+          } else {
+            sh_block_topk_weights[threadIdx.x] = Dtype::num2num2(topk_weight_tmp);
+          }
         } else {
           sh_block_topk_weights[threadIdx.x] = Dtype::num2num2(topk_weight_tmp);
         }
@@ -621,17 +681,17 @@ __global__ void Marlin(
   // A sizes/strides
 
   // stride of the A matrix in global memory
-  int a_gl_stride = prob_k / 8;
+  int a_gl_stride = prob_k / (kActFp8 ? 16 : 8);
   // stride of an A matrix tile in shared memory
-  constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
+  constexpr int a_sh_stride = 16 * thread_k_blocks / (kActFp8 ? 16 : 8);
   // delta between subsequent A tiles in global memory
-  constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8;
+  constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / (kActFp8 ? 16 : 8);
   // between subsequent accesses within a tile
   int a_gl_rd_delta_i = a_gl_stride * (threads / a_gl_rd_delta_o);
   // between shared memory writes
   constexpr int a_sh_wr_delta = a_sh_stride * (threads / a_gl_rd_delta_o);
   // between shared memory tile reads
-  constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
+  constexpr int a_sh_rd_delta_o = (kActFp8 ? 1 : 2) * ((threads / 32) / (thread_n_blocks / 4));
   // within a shared memory tile
   constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
   // overall size of a tile
@@ -651,6 +711,7 @@ __global__ void Marlin(
   constexpr int b_sh_rd_delta = threads * b_thread_vecs;
   constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
+  static_assert(!kActFp8 || b_sh_wr_iters % 2 == 0, "FP8 Marlin must pair adjacent K16 iterations");
 
   // Scale sizes/strides without act_order
   int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
@@ -687,7 +748,7 @@ __global__ void Marlin(
   // Shared read index.
   int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % (16 / (m_block_size_8 ? 2 : 1))) +
                 (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
-  a_sh_rd += 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
+  a_sh_rd += (kActFp8 ? 1 : 2) * ((threadIdx.x / 32) / (thread_n_blocks / 4));
 
   int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
   b_gl_rd += b_sh_stride * slice_col;
@@ -775,7 +836,8 @@ __global__ void Marlin(
   // each warp must also write a consecutive memory segment?
   auto transform_a = [&](int i) {
     int row = i / a_gl_rd_delta_o;
-    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+    constexpr int xor_rows = kActFp8 && a_gl_rd_delta_o < 8 ? a_gl_rd_delta_o : 8;
+    return a_gl_rd_delta_o * row + ((i % a_gl_rd_delta_o) ^ (row % xor_rows));
   };
   // Since the computation of this remapping is non-trivial and, due to our main
   // loop unrolls, all shared memory accesses are static, we simply precompute
@@ -826,10 +888,10 @@ __global__ void Marlin(
 
   // all remaining shared memory is used to cache A (input)
   // sh_a_max_row is at least ` stages * 16 * thread_m_blocks `
-  int sh_a_max_row = ((max_shared_mem - 1024) / 16 - shm_size_used) / (thread_k_blocks * 2);
+  int sh_a_max_row = ((max_shared_mem - 1024) / 16 - shm_size_used) / (thread_k_blocks * (kActFp8 ? 1 : 2));
 
   // Register storage for double buffer of shared memory reads.
-  FragA frag_a[2][thread_m_blocks];
+  InputFragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2][b_thread_vecs];
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];  // No act-order
@@ -978,8 +1040,13 @@ __global__ void Marlin(
   auto fetch_to_registers = [&](int k, int pipe, int pipe_a = 0) {
     int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe_a;
 #pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++)
-      ldsm<m_block_size_8 ? 2 : 4, scalar_t>(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+    for (int i = 0; i < thread_m_blocks; i++) {
+      if constexpr (kActFp8) {
+        ldsm_fp8_half(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+      } else {
+        ldsm<m_block_size_8 ? 2 : 4, scalar_t>(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+      }
+    }
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 
 #pragma unroll
@@ -1212,103 +1279,151 @@ __global__ void Marlin(
   bool is_first_matmul_in_slice = true;
   auto matmul = [&](int k) {
     int k2 = k % 2;
-    const bool is_new_zp = ((group_blocks != -1) && (group_blocks < thread_k_blocks || k == 0)) ||
-                           (group_blocks == -1 && is_first_matmul_in_slice);
-    if constexpr (has_zp && !is_zp_float) {
-      if (is_new_zp) {
-        if constexpr (group_blocks == -1) is_first_matmul_in_slice = false;
-        int zp_quant_0, zp_quant_1;
+    if constexpr (kActFp8) {
+      // Each Marlin register buffer represents a K16 slice. Pair the two
+      // buffers in the pipe into one FP8 K32 MMA.
+      if (k2 != 0) return;
 
-        if constexpr (w_type.size_bits() == 4) {
-          zp_quant_0 = frag_qzp[k2][0];
-          zp_quant_1 = zp_quant_0 >> 8;
-        } else {
-          static_assert(w_type.size_bits() == 8);
-          zp_quant_0 = frag_qzp[k2][0];
-          zp_quant_1 = frag_qzp[k2][1];
+      auto dequant_scale_buffer = [&](int buffer) {
+        int s_quant_0 = reinterpret_cast<int*>(frag_s[buffer])[0];
+        int s_quant_1 = reinterpret_cast<int*>(frag_s[buffer])[1];
+        dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[buffer]));
+        dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[buffer]) + 2);
+      };
+      dequant_scale_buffer(0);
+      dequant_scale_buffer(1);
+
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        FragB frag_b0[2];
+        FragB frag_b1[2];
+#pragma unroll
+        for (int buffer = 0; buffer < 2; ++buffer) {
+          int b_quant_1 = frag_b_quant[buffer][0][j];
+          int b_quant_0 = b_quant_1 << 8;
+          dequant_data(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0[buffer]));
+          dequant_data(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1[buffer]));
+          scale<scalar_t>(frag_b0[buffer], frag_s[buffer][j], 0);
+          scale<scalar_t>(frag_b1[buffer], frag_s[buffer][j], 1);
         }
 
-        dequant_data(zp_quant_0, reinterpret_cast<scalar_t2*>(&frag_zp));
-        dequant_data(zp_quant_1, reinterpret_cast<scalar_t2*>(&frag_zp) + 2);
-      }
-    }
-    if constexpr (!dequant_skip_flop && has_zp && is_zp_float) {
-      if (is_new_zp) {
-        reinterpret_cast<int4*>(&frag_zp)[0] = reinterpret_cast<int4*>(&frag_zpf[k2])[0];
-      }
-    }
+        Fp8FragB fp8_b0;
+        Fp8FragB fp8_b1;
+        fp8_b0[0] = pack_fp8_frag_b<scalar_t>(frag_b0[0]);
+        fp8_b0[1] = pack_fp8_frag_b<scalar_t>(frag_b0[1]);
+        fp8_b1[0] = pack_fp8_frag_b<scalar_t>(frag_b1[0]);
+        fp8_b1[1] = pack_fp8_frag_b<scalar_t>(frag_b1[1]);
 
-    // FP4/FP8 scale dequantization (E4M3 for NVFP4 and E8M0 for MXFP4).
-    if constexpr (
-        (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) &&
-        !(std::is_same<scalar_t2, half2>::value && s_type == host::kFE8M0fnu)) {
-      int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
-      int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+#pragma unroll
+        for (int i = 0; i < thread_m_blocks; ++i) {
+          Fp8FragA fp8_a;
+          fp8_a[0] = frag_a[0][i][0];
+          fp8_a[1] = frag_a[0][i][1];
+          fp8_a[2] = frag_a[1][i][0];
+          fp8_a[3] = frag_a[1][i][1];
+          mma_fp8(fp8_a, fp8_b0, frag_c[i][j][0]);
+          mma_fp8(fp8_a, fp8_b1, frag_c[i][j][1]);
+        }
+      }
+    } else {
+      const bool is_new_zp = ((group_blocks != -1) && (group_blocks < thread_k_blocks || k == 0)) ||
+                             (group_blocks == -1 && is_first_matmul_in_slice);
+      if constexpr (has_zp && !is_zp_float) {
+        if (is_new_zp) {
+          if constexpr (group_blocks == -1) is_first_matmul_in_slice = false;
+          int zp_quant_0, zp_quant_1;
 
-      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
-    }
+          if constexpr (w_type.size_bits() == 4) {
+            zp_quant_0 = frag_qzp[k2][0];
+            zp_quant_1 = zp_quant_0 >> 8;
+          } else {
+            static_assert(w_type.size_bits() == 8);
+            zp_quant_0 = frag_qzp[k2][0];
+            zp_quant_1 = frag_qzp[k2][1];
+          }
+
+          dequant_data(zp_quant_0, reinterpret_cast<scalar_t2*>(&frag_zp));
+          dequant_data(zp_quant_1, reinterpret_cast<scalar_t2*>(&frag_zp) + 2);
+        }
+      }
+      if constexpr (!dequant_skip_flop && has_zp && is_zp_float) {
+        if (is_new_zp) {
+          reinterpret_cast<int4*>(&frag_zp)[0] = reinterpret_cast<int4*>(&frag_zpf[k2])[0];
+        }
+      }
+
+      // FP4/FP8 scale dequantization (E4M3 for NVFP4 and E8M0 for MXFP4).
+      if constexpr (
+          (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) &&
+          !(std::is_same<scalar_t2, half2>::value && s_type == host::kFE8M0fnu)) {
+        int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
+        int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+
+        dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+        dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+      }
 
 // We have the m dimension as the inner loop in order to encourage overlapping
 // dequantization and matmul operations.
 #pragma unroll
-    for (int j = 0; j < 4; j++) {
-      FragB frag_b0;
-      FragB frag_b1;
-      int b_quant_0, b_quant_1;
+      for (int j = 0; j < 4; j++) {
+        FragB frag_b0;
+        FragB frag_b1;
+        int b_quant_0, b_quant_1;
 
-      if constexpr (w_type_id == host::kFE2M1f.id()) {
-        b_quant_1 = frag_b_quant[k2][0][j];
-        b_quant_0 = b_quant_1 << 8;
-      } else if constexpr (w_type.size_bits() == 4) {
-        b_quant_0 = frag_b_quant[k2][0][j];
-        b_quant_1 = b_quant_0 >> 8;
-      } else {
-        static_assert(w_type.size_bits() == 8);
-        int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
-        b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
-        b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
-      }
+        if constexpr (w_type_id == host::kFE2M1f.id()) {
+          b_quant_1 = frag_b_quant[k2][0][j];
+          b_quant_0 = b_quant_1 << 8;
+        } else if constexpr (w_type.size_bits() == 4) {
+          b_quant_0 = frag_b_quant[k2][0][j];
+          b_quant_1 = b_quant_0 >> 8;
+        } else {
+          static_assert(w_type.size_bits() == 8);
+          int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
+          b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
+          b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
+        }
 
-      dequant_data(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
-      dequant_data(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+        dequant_data(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+        dequant_data(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
 
-      if constexpr (dequant_skip_flop && has_zp && !is_zp_float) {
-        sub_zp<scalar_t>(frag_b0, frag_zp[j], 0);
-        sub_zp<scalar_t>(frag_b1, frag_zp[j], 1);
-      }
+        if constexpr (dequant_skip_flop && has_zp && !is_zp_float) {
+          sub_zp<scalar_t>(frag_b0, frag_zp[j], 0);
+          sub_zp<scalar_t>(frag_b1, frag_zp[j], 1);
+        }
 
-      // Apply scale to frag_b0
-      if constexpr (has_act_order) {
-        static_assert(group_blocks != -1);
-        scale4<scalar_t>(
-            frag_b0, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 0);
-        scale4<scalar_t>(
-            frag_b1, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 1);
-      } else if constexpr (!dequant_skip_flop && has_zp && !is_zp_float && group_blocks == -1) {
-        int idx = (threadIdx.x / 4) % 2;
-        scalar_t2 s2 = Dtype::nums2num2(
-            reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 0])[idx],
-            reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 1])[idx]);
-        if (is_new_zp) frag_zp[j] = __hmul2(frag_zp[j], s2);
-        scale_and_sub<scalar_t>(frag_b0, s2.x, frag_zp[j].x);
-        scale_and_sub<scalar_t>(frag_b1, s2.y, frag_zp[j].y);
-      } else if constexpr (!dequant_skip_flop && has_zp && group_blocks != -1) {
-        if (is_new_zp) frag_zp[j] = __hmul2(frag_zp[j], *reinterpret_cast<scalar_t2*>(&frag_s[k2][j]));
-        scale_and_sub<scalar_t>(frag_b0, frag_s[k2][j][0].x, frag_zp[j].x);
-        scale_and_sub<scalar_t>(frag_b1, frag_s[k2][j][0].y, frag_zp[j].y);
-      } else if constexpr (group_blocks != -1) {
-        scale<scalar_t>(frag_b0, frag_s[k2][j], 0);
-        scale<scalar_t>(frag_b1, frag_s[k2][j], 1);
-      }
+        // Apply scale to frag_b0
+        if constexpr (has_act_order) {
+          static_assert(group_blocks != -1);
+          scale4<scalar_t>(
+              frag_b0, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 0);
+          scale4<scalar_t>(
+              frag_b1, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 1);
+        } else if constexpr (!dequant_skip_flop && has_zp && !is_zp_float && group_blocks == -1) {
+          int idx = (threadIdx.x / 4) % 2;
+          scalar_t2 s2 = Dtype::nums2num2(
+              reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 0])[idx],
+              reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 1])[idx]);
+          if (is_new_zp) frag_zp[j] = __hmul2(frag_zp[j], s2);
+          scale_and_sub<scalar_t>(frag_b0, s2.x, frag_zp[j].x);
+          scale_and_sub<scalar_t>(frag_b1, s2.y, frag_zp[j].y);
+        } else if constexpr (!dequant_skip_flop && has_zp && group_blocks != -1) {
+          if (is_new_zp) frag_zp[j] = __hmul2(frag_zp[j], *reinterpret_cast<scalar_t2*>(&frag_s[k2][j]));
+          scale_and_sub<scalar_t>(frag_b0, frag_s[k2][j][0].x, frag_zp[j].x);
+          scale_and_sub<scalar_t>(frag_b1, frag_s[k2][j][0].y, frag_zp[j].y);
+        } else if constexpr (group_blocks != -1) {
+          scale<scalar_t>(frag_b0, frag_s[k2][j], 0);
+          scale<scalar_t>(frag_b1, frag_s[k2][j], 1);
+        }
 
 #pragma unroll
-      for (int i = 0; i < thread_m_blocks; i++) {
-        if constexpr (m_block_size_8) {
-          mma_trans<scalar_t>(frag_a[k2][i], frag_b0, frag_b1, frag_c[i][j][0]);
-        } else {
-          mma<scalar_t>(frag_a[k2][i], frag_b0, frag_c[i][j][0]);
-          mma<scalar_t>(frag_a[k2][i], frag_b1, frag_c[i][j][1]);
+        for (int i = 0; i < thread_m_blocks; i++) {
+          if constexpr (m_block_size_8) {
+            mma_trans<scalar_t>(frag_a[k2][i], frag_b0, frag_b1, frag_c[i][j][0]);
+          } else {
+            mma<scalar_t>(frag_a[k2][i], frag_b0, frag_c[i][j][0]);
+            mma<scalar_t>(frag_a[k2][i], frag_b1, frag_c[i][j][1]);
+          }
         }
       }
     }
@@ -1624,14 +1739,14 @@ __global__ void Marlin(
         int64_t sorted_row = sh_block_sorted_ids[row];
         int64_t true_idx = sorted_row * c_gl_stride + c_gl_wr % c_gl_stride;
         scalar_t2 topk_weight_score;
-        if (mul_topk_weights) topk_weight_score = sh_block_topk_weights[row];
-        if (use_atomic_add && slice_count > 1 || mul_topk_weights) {
+        if (mul_topk_weights || kActFp8) topk_weight_score = sh_block_topk_weights[row];
+        if (use_atomic_add && slice_count > 1 || mul_topk_weights || kActFp8) {
           scalar_t2* C_half2 = reinterpret_cast<scalar_t2*>(&C[true_idx]);
           scalar_t2* sh_red_half2 = reinterpret_cast<scalar_t2*>(&sh_red[c_sh_rd]);
 #pragma unroll
           for (int a = 0; a < 4; a++) {
             scalar_t2 res = sh_red_half2[a];
-            if (mul_topk_weights) {
+            if (mul_topk_weights || kActFp8) {
               res = __hmul2(res, topk_weight_score);
             }
 
