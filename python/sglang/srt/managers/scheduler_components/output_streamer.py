@@ -451,8 +451,10 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+
             self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
             self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
+
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
             self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 

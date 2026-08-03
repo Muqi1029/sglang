@@ -635,6 +635,7 @@ class SchedulerBatchResultProcessor:
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
+        # block-level accept
         block_accept_lens = (
             result.block_accept_lens.tolist()
             if result.block_accept_lens is not None
