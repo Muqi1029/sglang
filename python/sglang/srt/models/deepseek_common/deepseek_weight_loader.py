@@ -77,6 +77,25 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _get_linear_weight_block_size(
+    layer: nn.Module, quant_config: Optional[QuantizationConfig]
+):
+    """Resolve block shape from the layer before consulting global config.
+
+    Mixed compressed-tensors configs select schemes by layer-name regex, so the
+    global config cannot expose one meaningful ``weight_block_size``. The
+    selected scheme records the actual block shape on the constructed layer.
+    """
+    weight_block_size = getattr(layer, "weight_block_size", None)
+    if weight_block_size is not None:
+        return weight_block_size
+
+    selected_quant_config = getattr(quant_config, "linear_fp8_config", None)
+    if selected_quant_config is None:
+        selected_quant_config = quant_config
+    return getattr(selected_quant_config, "weight_block_size", None)
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -534,14 +553,8 @@ class DeepseekV2WeightLoaderMixin:
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
-                selected_quant_config = getattr(
-                    self.quant_config, "linear_fp8_config", None
-                )
-                if selected_quant_config is None:
-                    selected_quant_config = self.quant_config
-                weight_block_size = getattr(
-                    selected_quant_config, "weight_block_size", None
+                weight_block_size = _get_linear_weight_block_size(
+                    self_attn.kv_b_proj, self.quant_config
                 )
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
@@ -564,9 +577,7 @@ class DeepseekV2WeightLoaderMixin:
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
                         should_deepgemm_weight_requant_ue8m0(
-                            weight_block_size=getattr(
-                                self.quant_config, "weight_block_size", None
-                            )
+                            weight_block_size=weight_block_size
                         )
                         and weight_scale.format_ue8m0
                     ):
