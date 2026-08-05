@@ -3,7 +3,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 from collections.abc import Callable
-from typing import Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -17,6 +16,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_nvfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
@@ -35,7 +39,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        # Native W4A4 kernels need SM100, while Marlin consumes the same
+        # serialized NVFP4 weights with BF16/FP16 activations on SM80+.
+        return 80
 
     def create_weights(
         self,
@@ -50,6 +56,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
 
         # Weight
         weight = ModelWeightParameter(
@@ -92,6 +99,13 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        fp4_backend = get_fp4_gemm_runner_backend()
+        if not is_blackwell_supported() and not fp4_backend.is_marlin():
+            raise ValueError(
+                "Compressed-tensors NVFP4 native dense GEMM backends require "
+                "SM100+. Use --fp4-gemm-backend marlin on SM80-SM90."
+            )
+
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
@@ -99,7 +113,19 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
+        if fp4_backend.is_marlin():
+            # compressed-tensors stores the reciprocal convention used by its
+            # W4A4 kernels. Marlin expects the dequantization multiplier used by
+            # ModelOpt, hence the inversion before repacking.
+            layer.weight_global_scale = Parameter(
+                1 / layer.weight_global_scale, requires_grad=False
+            )
+            layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
+            delattr(layer, "weight_packed")
+            prepare_nvfp4_layer_for_marlin(layer, group_size=self.group_size)
+            return
+
+        if fp4_backend.is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -135,8 +161,20 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if get_fp4_gemm_runner_backend().is_marlin():
+            return apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_global_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
         output_shape = [x.shape[0], w_n]

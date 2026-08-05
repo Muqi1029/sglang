@@ -124,11 +124,13 @@ def apply_fp4_marlin_linear(
     return output.reshape(out_shape)
 
 
-def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
-    if getattr(layer, "quant_config", None) is not None:
+def prepare_nvfp4_layer_for_marlin(
+    layer: torch.nn.Module, group_size: int | None = None
+) -> None:
+    if group_size is None and getattr(layer, "quant_config", None) is not None:
         group_size = layer.quant_config.group_size
-        if group_size != 16:
-            raise ValueError(f"NVFP4 Marlin requires group_size=16, got {group_size}.")
+    if group_size is not None and group_size != 16:
+        raise ValueError(f"NVFP4 Marlin requires group_size=16, got {group_size}.")
 
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition
@@ -405,11 +407,13 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             delattr(layer, stale)
 
 
-def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
-    if layer.quant_config.group_size != 16:
-        raise ValueError(
-            f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
-        )
+def prepare_moe_nvfp4_layer_for_marlin(
+    layer: torch.nn.Module, group_size: int | None = None
+) -> None:
+    if group_size is None:
+        group_size = layer.quant_config.group_size
+    if group_size != 16:
+        raise ValueError(f"NVFP4 Marlin MoE requires group_size=16, got {group_size}.")
 
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
