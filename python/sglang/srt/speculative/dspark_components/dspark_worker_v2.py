@@ -149,7 +149,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 type(self.draft_model.markov_head).__name__,
             )
 
-        # 0, 1, ..., gemma
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )

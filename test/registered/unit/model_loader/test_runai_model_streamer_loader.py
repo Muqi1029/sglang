@@ -113,6 +113,55 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         marked.fill_(2)
         self.assertEqual(cloned.item(), 1)
 
+    def test_fused_indexer_loads_compressed_tensors_block_scale(self):
+        prefix = "model.layers.0.self_attn.indexer"
+        fused_name = f"{prefix}.wk_weights_proj.weight"
+        fused_param = torch.nn.Parameter(
+            torch.zeros((160, 6144), dtype=torch.bfloat16), requires_grad=False
+        )
+        weight = torch.zeros((128, 6144), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((1, 48), dtype=torch.float32)
+        dequantized = torch.ones((128, 6144), dtype=torch.bfloat16)
+        pending = {}
+
+        with patch.object(
+            deepseek_weight_loader,
+            "block_quant_dequant",
+            return_value=dequantized,
+        ) as dequant:
+            consumed_scale = deepseek_weight_loader._load_fused_indexer_wk(
+                f"{prefix}.wk.weight_scale",
+                scale,
+                {fused_name: fused_param},
+                pending,
+                SimpleNamespace(weight_block_size=[128, 128]),
+            )
+            consumed_weight = deepseek_weight_loader._load_fused_indexer_wk(
+                f"{prefix}.wk.weight",
+                weight,
+                {fused_name: fused_param},
+                pending,
+                SimpleNamespace(weight_block_size=[128, 128]),
+            )
+
+        self.assertTrue(consumed_scale)
+        self.assertTrue(consumed_weight)
+        self.assertEqual(pending, {})
+        dequant.assert_called_once_with(weight, scale, [128, 128], torch.bfloat16)
+        torch.testing.assert_close(fused_param.data[:128], dequantized)
+
+    def test_linear_block_size_prefers_selected_compressed_tensors_scheme(self):
+        layer = SimpleNamespace(weight_block_size=[128, 128])
+        mixed_config = SimpleNamespace(
+            weight_block_size=None,
+            linear_fp8_config=None,
+        )
+
+        self.assertEqual(
+            deepseek_weight_loader._get_linear_weight_block_size(layer, mixed_config),
+            [128, 128],
+        )
+
     def test_runai_streamed_tensor_is_consumed_before_buffer_reuse(self):
         def consume_view(mark_as_runai: bool):
             shared_buffer = torch.tensor([1], dtype=torch.int32)
