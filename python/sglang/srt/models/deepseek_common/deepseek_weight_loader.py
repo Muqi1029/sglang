@@ -103,7 +103,9 @@ def _load_fused_indexer_wk(
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
+    # ModelOpt names the multiplicative block scale ``weight_scale_inv`` while
+    # compressed-tensors names the same dequantization operand ``weight_scale``.
+    is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
