@@ -149,6 +149,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 type(self.draft_model.markov_head).__name__,
             )
 
+        # 0, 1, 2, ..., gemma (gemma + 1 in total)
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
@@ -561,6 +562,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
+        # compute confidence
         confidence = proposal.confidence
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
