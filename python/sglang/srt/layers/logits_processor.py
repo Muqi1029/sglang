@@ -163,6 +163,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
+    # concatenation, so the post-norm last hidden is exposed here separately.
+    last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -447,6 +450,27 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        # Spec-training capture: keep the post-norm last hidden (the training
+        # target) alongside the aux concatenation in hidden_states_to_store.
+        last_hidden_states_to_store = (
+            hidden_states
+            if (
+                logits_metadata.capture_hidden_mode.is_full()
+                and aux_hidden_states is not None
+            )
+            else None
+        )
+        # muP targets pass LM-head-scaled hidden states into LogitsProcessor,
+        # while SpecForge folds the same multiplier into its frozen target
+        # head. Restore the pre-head-scale representation before capture so
+        # the multiplier is applied exactly once when training recomputes logits.
+        logits_mup_width_multiplier = getattr(
+            self.config, "logits_mup_width_multiplier", None
+        )
+        if last_hidden_states_to_store is not None and logits_mup_width_multiplier:
+            last_hidden_states_to_store = last_hidden_states_to_store * float(
+                logits_mup_width_multiplier
+            )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -460,6 +484,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
                 # FIXME: These fields are not logits-related but are passed through here as a
                 # workaround since ForwardBatch is local to forward_batch_generation().
                 # They should be moved to GenerationBatchResult to keep this class clean.
@@ -480,6 +505,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            last_hidden_states=last_hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)

@@ -354,6 +354,25 @@ class ModelRunner:
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
 
+        if (
+            getattr(server_args, "enable_spec_capture", False)
+            and not self.is_draft_worker
+        ):
+            capture_layer_ids = getattr(server_args, "spec_capture_aux_layer_ids", None)
+            # Aux capture without a draft worker, routed through the target
+            # model's strategy-specific capture hook.
+            if getattr(server_args, "spec_capture_method", "dspark") in (
+                "dflash",
+                "dspark",
+            ):
+                self.spec_aux_config.dflash_use_aux_hidden_state = True
+                self.spec_aux_config.dflash_target_layer_ids = capture_layer_ids
+            else:
+                self.spec_aux_config.eagle_use_aux_hidden_state = True
+                self.spec_aux_config.eagle_aux_hidden_state_layer_ids = (
+                    capture_layer_ids
+                )
+
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -927,7 +946,14 @@ class ModelRunner:
             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
-            is_dspark=self.spec_algorithm.is_dspark(),
+            is_dspark=(
+                self.spec_algorithm.is_dspark()
+                or (
+                    getattr(self.server_args, "enable_spec_capture", False)
+                    and getattr(self.server_args, "spec_capture_method", "dspark")
+                    == "dspark"
+                )
+            ),
         )
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).

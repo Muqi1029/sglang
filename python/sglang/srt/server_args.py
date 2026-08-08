@@ -3370,6 +3370,30 @@ class ServerArgs:
         ),
         NS("exec.features"),
     ] = None
+    enable_spec_capture: A[
+        bool,
+        "Enable server-side speculative-training capture: per-request aux/last "
+        "hidden states are written to a Mooncake store (SpecForge DataFlow "
+        "layout) instead of the response payload. Enables aux-hidden-state "
+        "capture on the target model without a speculative draft worker.",
+        NS("exec.features"),
+    ] = False
+    spec_capture_aux_layer_ids: A[
+        Optional[List[int]],
+        "Target layer ids whose hidden states are concatenated for spec-capture "
+        "requests. DSPARK requires this option to be set explicitly.",
+        NS("exec.features"),
+    ] = None
+    spec_capture_method: A[
+        str,
+        Arg(
+            help="Capture method for --enable-spec-capture. It must match the "
+            "draft strategy being trained because each method wires capture "
+            "onto different target-model submodules.",
+            choices=["eagle3", "dflash", "dspark"],
+        ),
+        NS("exec.features"),
+    ] = "dspark"
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",
@@ -3472,6 +3496,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+        self._handle_spec_capture()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3649,6 +3674,26 @@ class ServerArgs:
                 self.return_hidden_states_mode = "full"
         else:
             self.enable_return_hidden_states = True
+
+    def _handle_spec_capture(self):
+        if not self.enable_spec_capture:
+            return
+        if self.spec_capture_method not in ("eagle3", "dflash", "dspark"):
+            raise ValueError(
+                "spec_capture_method must be one of: 'eagle3', 'dflash', or "
+                "'dspark'."
+            )
+        if self.spec_capture_method == "dspark" and not self.spec_capture_aux_layer_ids:
+            raise ValueError(
+                "--enable-spec-capture with DSPARK requires explicit "
+                "--spec-capture-aux-layer-ids."
+            )
+
+        # Spec-capture writes every token's hidden states. CUDA graphs are
+        # created at startup, so they must be captured at the FULL mode rather
+        # than waiting for a capture request to elevate its runtime mode.
+        self.return_hidden_states_mode = "full"
+        self.enable_return_hidden_states = True
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:

@@ -93,6 +93,24 @@ class TestPrepareServerArgs(CustomTestCase):
 
         self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
 
+    def test_spec_capture_requires_full_hidden_state_graphs(self):
+        spec_capture = ServerArgs(
+            model_path="dummy",
+            enable_spec_capture=True,
+            spec_capture_aux_layer_ids=[1, 9, 17, 25, 33],
+        )
+        self.assertTrue(spec_capture.enable_return_hidden_states)
+        self.assertEqual(spec_capture.return_hidden_states_mode, "full")
+
+        explicit_last = ServerArgs(
+            model_path="dummy",
+            enable_spec_capture=True,
+            spec_capture_aux_layer_ids=[1],
+            return_hidden_states_mode="last",
+        )
+        self.assertTrue(explicit_last.enable_return_hidden_states)
+        self.assertEqual(explicit_last.return_hidden_states_mode, "full")
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")

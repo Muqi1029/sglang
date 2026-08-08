@@ -227,6 +227,10 @@ class GenerateReqInput:
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
     ] = False
+    # Spec-training capture sink instructions (see spec_capture_sink.py).
+    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
+    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
+
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -514,6 +518,7 @@ class GenerateReqInput:
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
+        self._normalize_spec_capture(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
@@ -693,6 +698,15 @@ class GenerateReqInput:
             get_return_hidden_states_mode(self.return_hidden_states)
             self.return_hidden_states = [self.return_hidden_states] * num
 
+    def _normalize_spec_capture(self, num):
+        if not isinstance(self.spec_capture, list):
+            return
+        if len(self.spec_capture) != self.batch_size:
+            raise ValueError(
+                "The length of spec_capture should be equal to the batch size."
+            )
+        self.spec_capture = self.spec_capture * self.parallel_sample_num
+
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
         if self.custom_logit_processor is None:
@@ -856,6 +870,11 @@ class GenerateReqInput:
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            spec_capture=(
+                self.spec_capture[i]
+                if isinstance(self.spec_capture, list)
+                else self.spec_capture
+            ),
         )
         cache[i] = sub
         return sub
@@ -953,6 +972,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
     encoder_urls: Optional[List[str]] = None
+
+    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
+    spec_capture: Optional[Dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -1382,6 +1404,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    # Spec-training capture: one result dict per request (see spec_capture_sink).
+    spec_capture: Optional[List[Any]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1472,6 +1497,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    # Spec-training capture: one result dict per request (see spec_capture_sink).
+    spec_capture: Optional[List[Any]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None

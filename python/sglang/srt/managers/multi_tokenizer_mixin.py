@@ -250,6 +250,9 @@ def _handle_output_by_index(output, i):
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
+            spec_capture=_extract_field_by_index(
+                output, "spec_capture", i, check_length=False
+            ),
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
             ),
@@ -366,6 +369,9 @@ def _handle_output_by_index(output, i):
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
+            ),
+            spec_capture=_extract_field_by_index(
+                output, "spec_capture", i, check_length=False
             ),
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False

@@ -42,6 +42,7 @@ import dataclasses
 import logging
 import re
 import sys
+import uuid
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -845,6 +846,7 @@ class Req(ReqDllmMixin):
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
         return_pooled_hidden_states: bool = False,
+        spec_capture: Optional[Dict[str, Any]] = None,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
     ):
@@ -911,16 +913,31 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
+        self.spec_capture = spec_capture
         self.return_hidden_states = return_hidden_states
-        self.return_hidden_states_mode = get_return_hidden_states_mode(
-            return_hidden_states
+        self.return_hidden_states_mode = max(
+            get_return_hidden_states_mode(return_hidden_states),
+            (
+                CaptureHiddenMode.FULL
+                if spec_capture is not None
+                else CaptureHiddenMode.NULL
+            ),
         )
+        self.spec_capture_aux: List[torch.Tensor] = []
+        self.spec_capture_last_hidden: List[torch.Tensor] = []
+        self.spec_capture_result = None
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+        if spec_capture is not None:
+            # A prefix-cache hit omits already-computed prompt rows from the
+            # forward output, which would silently truncate a training sample.
+            # Keep capture requests isolated while preserving cache reuse for
+            # normal traffic on the same server.
+            extra_key = f"{extra_key or ''}|spec-capture:{uuid.uuid4().hex}"
 
         self.extra_key = extra_key
         self.lora_id = lora_id

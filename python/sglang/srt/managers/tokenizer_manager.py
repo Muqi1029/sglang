@@ -1224,6 +1224,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            spec_capture_requested = (
+                any(item is not None for item in obj.spec_capture)
+                if isinstance(obj.spec_capture, list)
+                else obj.spec_capture is not None
+            )
+            if spec_capture_requested and not getattr(
+                self.server_args, "enable_spec_capture", False
+            ):
+                raise ValueError(
+                    "spec_capture requests require the server to be launched with "
+                    "--enable-spec-capture."
+                )
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1414,6 +1426,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                spec_capture=obj.spec_capture,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -2338,6 +2351,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
                     meta_info["hidden_states"] = hidden_states
+            if getattr(recv_obj, "spec_capture", None):
+                sc = recv_obj.spec_capture[i]
+                if sc is not None:
+                    meta_info["spec_capture"] = sc
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
