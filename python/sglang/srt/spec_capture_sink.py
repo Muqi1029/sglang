@@ -33,7 +33,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -67,9 +69,13 @@ class SpecCaptureSink:
         self._store = None
         self._put_config = None
         self._lock = threading.Lock()
-        # Retried HTTP requests reuse deterministic keys.  Striped locks keep
-        # replacement atomic per key without retaining one lock per sample.
-        self._write_locks = [threading.Lock() for _ in range(256)]
+        # One store writer is sufficient: Mooncake already stripes a batched
+        # transfer internally. The executor decouples that host transfer from
+        # the scheduler so the next target prefill can run concurrently.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="spec-capture-batch-put",
+        )
 
     # -- connection ---------------------------------------------------------
     def _connect(self):
@@ -116,69 +122,91 @@ class SpecCaptureSink:
     def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
         return f"{store_id}/{sample_id}/g{gen}/{name}"
 
-    def _put_tensor(self, key: str, t: torch.Tensor, *, replace: bool = False) -> None:
-        store = self._connect()
-        t = t.detach().to("cpu").contiguous()
-        nbytes = t.element_size() * t.numel()
-        lock = self._write_locks[hash(key) % len(self._write_locks)]
-        with lock:
-            if replace:
-                # Do not probe with is_exist(): Mooncake existence checks can
-                # acquire a read lease that prevents the following removal.
-                self._remove_quiet(key)
-            try:
-                store.register_buffer(t.data_ptr(), nbytes)
-            except Exception:
-                pass  # some builds auto-register
-            try:
-                rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
-            finally:
-                try:
-                    store.unregister_buffer(t.data_ptr())
-                except Exception:
-                    pass
-        if rc is not None and int(rc) < 0:
-            raise RuntimeError(f"spec-capture put_from failed (status {rc}) for {key}")
-
     def _remove_quiet(self, key: str) -> None:
         try:
             self._connect().remove(key)
         except Exception:
             pass
 
-    # -- the one entry point --------------------------------------------------
-    def put_sample(
+    def _remove_many_quiet(self, keys: List[str]) -> None:
+        if not keys:
+            return
+        store = self._connect()
+        batch_remove = getattr(store, "batch_remove", None)
+        if batch_remove is not None:
+            try:
+                batch_remove(keys)
+                return
+            except Exception:
+                pass
+        for key in keys:
+            self._remove_quiet(key)
+
+    # -- the batch entry point ------------------------------------------------
+    def submit_samples(
         self,
-        spec: Dict[str, Any],
-        *,
-        aux: Optional[torch.Tensor],
-        last_hidden: Optional[torch.Tensor],
-    ) -> Dict[str, Any]:
-        """Write one sample's artifacts; return the meta_info result dict.
+        samples: List[
+            Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
+        ],
+    ) -> Future[List[Dict[str, Any]]]:
+        """Queue one scheduler batch without blocking the scheduler thread."""
+        return self._executor.submit(self.put_samples, samples)
 
-        ``aux``/``last_hidden`` are the per-request (L, W) captured tensors,
-        stored with a leading batch dim of 1. On any failure the keys already
-        written are best-effort removed (no partial sample is consumable).
+    def put_samples(
+        self,
+        samples: List[
+            Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
+        ],
+    ) -> List[Dict[str, Any]]:
+        """Publish a scheduler batch with one native Mooncake batch RPC.
+
+        The response is emitted only after every object succeeds, so returned
+        refs can never point at incomplete samples.
         """
-        store_id = str(spec["store_id"])
-        sample_id = str(spec["sample_id"])
-        gen = int(spec.get("gen", 1))
-        replace = bool(spec.get("replace", False))
-        features: Dict[str, str] = dict(spec.get("features") or {})
+        if not samples:
+            return []
 
-        written: List[str] = []
-        result_feats: Dict[str, Dict[str, Any]] = {}
+        store = self._connect()
+        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
+        started = time.perf_counter()
+        keys: List[str] = []
+        tensors: List[torch.Tensor] = []
+        sizes: List[int] = []
+        replace_keys: List[str] = []
+        results: List[Dict[str, Any]] = []
 
-        def _write(name: str, t: torch.Tensor) -> None:
+        def _stage(
+            result_feats: Dict[str, Dict[str, Any]],
+            *,
+            store_id: str,
+            sample_id: str,
+            gen: int,
+            replace: bool,
+            name: str,
+            tensor: torch.Tensor,
+        ) -> None:
+            tensor = tensor.detach().to("cpu").contiguous()
             key = self._tkey(store_id, sample_id, gen, name)
-            self._put_tensor(key, t, replace=replace)
-            written.append(key)
+            keys.append(key)
+            tensors.append(tensor)
+            sizes.append(tensor.element_size() * tensor.numel())
+            if replace:
+                replace_keys.append(key)
             result_feats[name] = {
-                "shape": list(t.shape),
-                "dtype": _DTYPE_STR.get(t.dtype, str(t.dtype).replace("torch.", "")),
+                "shape": list(tensor.shape),
+                "dtype": _DTYPE_STR.get(
+                    tensor.dtype, str(tensor.dtype).replace("torch.", "")
+                ),
             }
 
-        try:
+        for spec, aux, last_hidden in samples:
+            store_id = str(spec["store_id"])
+            sample_id = str(spec["sample_id"])
+            gen = int(spec.get("gen", 1))
+            replace = bool(spec.get("replace", False))
+            features: Dict[str, str] = dict(spec.get("features") or {})
+            result_feats: Dict[str, Dict[str, Any]] = {}
+
             aux_name = features.get(_ARTIFACT_AUX)
             if aux_name is not None:
                 if aux is None:
@@ -187,7 +215,15 @@ class SpecCaptureSink:
                         "captured — launch the server with --enable-spec-capture "
                         "(and optionally --spec-capture-aux-layer-ids)"
                     )
-                _write(aux_name, aux.unsqueeze(0))
+                _stage(
+                    result_feats,
+                    store_id=store_id,
+                    sample_id=sample_id,
+                    gen=gen,
+                    replace=replace,
+                    name=aux_name,
+                    tensor=aux.unsqueeze(0),
+                )
             lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
             if lh_name is not None:
                 if last_hidden is None:
@@ -195,7 +231,15 @@ class SpecCaptureSink:
                         "spec_capture requested 'last_hidden' but the logits "
                         "processor did not return it (is aux capture enabled?)"
                     )
-                _write(lh_name, last_hidden.unsqueeze(0))
+                _stage(
+                    result_feats,
+                    store_id=store_id,
+                    sample_id=sample_id,
+                    gen=gen,
+                    replace=replace,
+                    name=lh_name,
+                    tensor=last_hidden.unsqueeze(0),
+                )
             for item in spec.get("passthrough") or []:
                 dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
                 if dtype is None:
@@ -206,19 +250,106 @@ class SpecCaptureSink:
                 t = torch.tensor(item["data"], dtype=dtype).reshape(
                     [int(d) for d in item["shape"]]
                 )
-                _write(str(item["name"]), t)
-        except Exception:
-            for key in written:
-                self._remove_quiet(key)
-            raise
+                _stage(
+                    result_feats,
+                    store_id=store_id,
+                    sample_id=sample_id,
+                    gen=gen,
+                    replace=replace,
+                    name=str(item["name"]),
+                    tensor=t,
+                )
+            results.append(
+                {
+                    "sample_id": sample_id,
+                    "store_id": store_id,
+                    "gen": gen,
+                    "aux_layer_ids": self.aux_layer_ids,
+                    "features": result_feats,
+                }
+            )
 
-        return {
-            "sample_id": sample_id,
-            "store_id": store_id,
-            "gen": gen,
-            "aux_layer_ids": self.aux_layer_ids,
-            "features": result_feats,
-        }
+        materialize_ms = (time.perf_counter() - started) * 1000.0
+        self._remove_many_quiet(replace_keys)
+        registered: List[torch.Tensor] = []
+        register_started = time.perf_counter()
+        try:
+            for tensor, nbytes in zip(tensors, sizes):
+                try:
+                    store.register_buffer(tensor.data_ptr(), nbytes)
+                    registered.append(tensor)
+                except Exception:
+                    pass  # TCP and some Mooncake builds auto-register
+            register_ms = (time.perf_counter() - register_started) * 1000.0
+            put_started = time.perf_counter()
+            batch_put = getattr(store, "batch_put_from", None)
+            if batch_put is None:
+                statuses = [
+                    store.put_from(key, tensor.data_ptr(), nbytes, self._put_config)
+                    for key, tensor, nbytes in zip(keys, tensors, sizes)
+                ]
+            else:
+                statuses = batch_put(
+                    keys,
+                    [tensor.data_ptr() for tensor in tensors],
+                    sizes,
+                    self._put_config,
+                )
+            put_ms = (time.perf_counter() - put_started) * 1000.0
+        except Exception:
+            self._remove_many_quiet(keys)
+            raise
+        finally:
+            for tensor in registered:
+                try:
+                    store.unregister_buffer(tensor.data_ptr())
+                except Exception:
+                    pass
+
+        if statuses is None:
+            statuses = [0] * len(keys)
+        if len(statuses) != len(keys):
+            self._remove_many_quiet(keys)
+            raise RuntimeError(
+                "spec-capture batch_put_from returned "
+                f"{len(statuses)} statuses for {len(keys)} keys"
+            )
+        failed = [
+            (key, status)
+            for key, status in zip(keys, statuses)
+            if status is not None and int(status) < 0
+        ]
+        if failed:
+            self._remove_many_quiet(keys)
+            raise RuntimeError(
+                "spec-capture batch_put_from failed for "
+                f"{len(failed)}/{len(keys)} keys; first={failed[0]}"
+            )
+
+        if timing_enabled:
+            logger.info(
+                "[spec-capture-timing] batch_sink samples=%d objects=%d "
+                "bytes=%d materialize_ms=%.3f register_ms=%.3f put_ms=%.3f "
+                "total_ms=%.3f",
+                len(samples),
+                len(keys),
+                sum(sizes),
+                materialize_ms,
+                register_ms,
+                put_ms,
+                (time.perf_counter() - started) * 1000.0,
+            )
+        return results
+
+    def put_sample(
+        self,
+        spec: Dict[str, Any],
+        *,
+        aux: Optional[torch.Tensor],
+        last_hidden: Optional[torch.Tensor],
+    ) -> Dict[str, Any]:
+        """Keep the single-sample entry point for external callers and tests."""
+        return self.put_samples([(spec, aux, last_hidden)])[0]
 
 
 _SINK: Optional[SpecCaptureSink] = None

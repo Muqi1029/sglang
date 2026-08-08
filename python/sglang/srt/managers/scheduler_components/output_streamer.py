@@ -162,6 +162,12 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            if self.server_args.enable_spec_capture and req.spec_capture is not None:
+                # A capture request is complete only after every feature has
+                # been durably published. Centralizing the barrier here keeps
+                # alternate scheduler paths from sending a metadata-less 200.
+                if req.finished() and req.spec_capture_result is None:
+                    continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.

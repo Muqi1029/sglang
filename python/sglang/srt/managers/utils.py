@@ -120,6 +120,12 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if return_hidden_states and self.logits_output.last_hidden_states is not None:
+            # Spec-capture's post-norm last hidden rides the same async D2H
+            # stream as the auxiliary hidden states.
+            self.logits_output.last_hidden_states = _async_d2h(
+                self.logits_output.last_hidden_states
+            )
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(

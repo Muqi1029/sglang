@@ -3538,6 +3538,13 @@ class Scheduler(
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
+    def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
+        """Avoid redundant multi-GiB capture D2H on non-writer TP ranks."""
+        return batch.return_hidden_states and (
+            self.ps.attn_tp_rank == 0
+            or any(req.spec_capture is None for req in batch.reqs)
+        )
+
     @contextmanager
     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
         """Make SB transactional across one forward (overlap and non-overlap).
@@ -3686,7 +3693,9 @@ class Scheduler(
                                 # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
+                                        batch
+                                    ),
                                 )
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
@@ -3696,7 +3705,9 @@ class Scheduler(
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
+                                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
+                                            batch
+                                        ),
                                     )
                         else:
                             batch_result.future_indices = future_indices
@@ -3735,7 +3746,7 @@ class Scheduler(
                 batch_result.copy_done = self.device_module.Event()
                 batch_result.copy_to_cpu(
                     return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
+                    return_hidden_states=self._should_copy_hidden_states_to_cpu(batch),
                 )
             else:
                 kwargs = (
@@ -3857,7 +3868,7 @@ class Scheduler(
             self._relay_forward_payload(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
+                return_hidden_states=self._should_copy_hidden_states_to_cpu(cur_batch),
             )
 
         # Release the closure and large GPU tensors that are no longer needed.
@@ -3876,6 +3887,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Complete capture transfers on the scheduler thread before processing
+        # the next result, preserving output socket single-thread ownership.
+        self.batch_result_processor.drain_spec_captures()
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
@@ -3992,6 +4006,13 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
+        # Do not enter the idle sleeper while a capture future is outstanding;
+        # the producer may be waiting for the response that completes here.
+        self.batch_result_processor.drain_spec_captures()
+        if self.batch_result_processor.has_pending_spec_captures():
+            time.sleep(0.001)
+            return
+
         if not self.is_fully_idle():
             return
 
@@ -4042,6 +4063,7 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
+            and not self.batch_result_processor.has_pending_spec_captures()
             and self._pp_microbatches_drained()
         )
 
