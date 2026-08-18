@@ -435,7 +435,9 @@ def fetch_server_context(
     internal_states = info.get("internal_states") or []
     if not internal_states:
         raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
+
     sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
+
     for rank_index, payload in enumerate(sps_payloads):
         if payload is None:
             raise ValueError(
@@ -447,6 +449,7 @@ def fetch_server_context(
                 f"{INFO_RECORD_PAYLOAD_KEY}.mode must be one of {allowed_modes}, "
                 f"got {payload.get('mode')!r} on DP rank {rank_index}."
             )
+
         components = payload.get("components") or []
         missing = {"core", "step_cpu_time"} - set(components)
         if missing:
@@ -465,6 +468,7 @@ def fetch_server_context(
                 "the per-step KV conditioning is deterministic instead of "
                 "drifting with the model's accept behavior)."
             )
+
     verify_num_draft_tokens = {
         int(payload["verify_num_draft_tokens"]) for payload in sps_payloads
     }
