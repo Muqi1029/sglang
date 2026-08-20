@@ -772,13 +772,13 @@ def _score_edges(
     *,
     predecessor_table: torch.Tensor,
     successor_table: torch.Tensor,
-    candidate_ids: torch.Tensor,
-    unary_logits: torch.Tensor,
-    hidden: torch.Tensor,
-    anchor_token_ids: torch.Tensor,
+    candidate_ids: torch.Tensor,  # [bs, block_size - 1, topk]
+    unary_logits: torch.Tensor,  # [bs, block_size - 1, topk]
+    hidden: torch.Tensor,  # [bs, block_size - 1, rank]
+    anchor_token_ids: torch.Tensor,  # [bs]
     top_k: int,
 ) -> torch.Tensor:
-    keys = successor_table[candidate_ids]
+    keys = successor_table[candidate_ids]  # [bs, block_size - 1, topk, rank]
     # Concatenate the ids and look them up once. Concatenating the looked-up rows
     # instead moves a [b, slots, k, rank] float tensor where this moves one id per
     # candidate, and it costs a second gather for the anchor.
@@ -786,10 +786,12 @@ def _score_edges(
         [anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]],
         dim=1,
     )
-    predecessors = predecessor_table[predecessor_ids]
+    predecessors = predecessor_table[
+        predecessor_ids
+    ]  # (bs, block_size - 1, topk, rank)
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], keys
-    )
+    )  # [bs, block_size - 1, topk, topk]
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)

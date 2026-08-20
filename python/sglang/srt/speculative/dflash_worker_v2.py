@@ -181,7 +181,7 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     candidate_ids, unary_logits = draft_model.compute_candidates(
         pred_hidden.reshape(-1, pred_hidden.shape[-1])
     )
-    candidate_ids = candidate_ids.view(bs, num_pred, -1)
+    candidate_ids = candidate_ids.view(bs, num_pred, -1)  # [bs, block_size - 1, top_k]
     return candidate_ids, draft_model.candidate_selector.build_lattice(
         candidate_ids=candidate_ids,
         unary_logits=unary_logits.view(bs, num_pred, -1),
@@ -238,6 +238,9 @@ class _SelectorDraftSampler:
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        # candidate_ids: [bs, block_size - 1, topk]
+        # scores: [bs, block_size - 1, topk, topk]
+
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,

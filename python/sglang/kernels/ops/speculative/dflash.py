@@ -269,7 +269,7 @@ def _selector_walk_kernel(
         base = (row * slots + slot) * top_k
         scores = tl.load(scores_ptr + (base + previous) * top_k + offsets).to(
             tl.float32
-        )
+        )  # [top_k]
         if greedy:
             best = tl.max(scores, axis=0)
             index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
