@@ -180,7 +180,7 @@ class DsparkInfoDumper:
             InfoComponent(component) for component in components
         }
 
-        # report
+        # default 0
         self._sps_report_interval = int(sps_report_interval)
         if self._sps_report_interval > 0:
             # if set, add step_gpu_time
@@ -199,6 +199,7 @@ class DsparkInfoDumper:
 
         self._prev_stamp: Optional[float] = None
 
+        # add reqs for d2h stream
         self._d2h_stream: Optional[torch.cuda.Stream] = None
         if self.enabled and InfoComponent.REQS in self._components:
             # if reqs, add d2h cuda stream
@@ -214,6 +215,8 @@ class DsparkInfoDumper:
             return
         self._current_segments = {}
         self._open_segments = {}
+
+        # add init step gpu event
         if InfoComponent.STEP_GPU_TIME in self._components:
             self._open_segment(InfoSegment.STEP)
 
@@ -236,9 +239,12 @@ class DsparkInfoDumper:
     def observe_decode_step(self, obs: DecodeStepObservation) -> None:
         if not self.enabled:
             return
+
+        # full decode gpu time
         if InfoComponent.STEP_GPU_TIME in self._components:
             self._close_segment(InfoSegment.STEP)
 
+        # record cpu time
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
         self._drain_pending()
@@ -246,6 +252,7 @@ class DsparkInfoDumper:
         future = (
             self._stage_reqs(obs) if InfoComponent.REQS in self._components else None
         )
+
         self._pending = _PendingStep(
             forward_ct=int(obs.forward_ct),
             bs=int(obs.bs),
@@ -362,14 +369,22 @@ class DsparkInfoDumper:
             record.predicted_theta = pending.predicted_theta
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
+
+        # gpu time: needs synchronize
+
+        # step gpu
         if InfoComponent.STEP_GPU_TIME in self._components:
             record.step_gpu_ms = self._segment_ms(pending, InfoSegment.STEP)
+        # draft gpu
         if InfoComponent.DRAFT_GPU_TIME in self._components:
             record.draft_gpu_ms = self._segment_ms(pending, InfoSegment.DRAFT)
+        # target verify gpu
         if InfoComponent.TARGET_VERIFY_GPU_TIME in self._components:
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
             )
+
+        # req
         if InfoComponent.REQS in self._components and pending.future is not None:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
@@ -377,9 +392,10 @@ class DsparkInfoDumper:
         elif pending.future is not None:
             pending.future.wait()
 
+        # append this finished pending record
         self._records.append(record)
 
-        # maybe report
+        # logger report
         if self._sps_report_interval > 0:
             self._report_sps_prediction(pending=pending, step_gpu_ms=record.step_gpu_ms)
 
@@ -439,7 +455,7 @@ class DsparkInfoDumper:
             return None
         start, end = events
         end.synchronize()
-        elapsed_ms = start.elapsed_time(end)
+        elapsed_ms = start.elapsed_time(end)  # record gpu time
         if elapsed_ms > self._max_step_cpu_seconds * 1000.0:
             return None
         return round(elapsed_ms, 4)
@@ -855,6 +871,8 @@ class DsparkStepObservers:
         dp_tier_num_tokens: Optional[int],
     ) -> None:
         planner = self._planner
+
+        # maybe record sts
         if not proposal_folded:
             self._maybe_record_sts_collect(
                 verify_ids_2d=verify_ids_2d,
@@ -869,6 +887,7 @@ class DsparkStepObservers:
                 target_logits=target_logits,
                 bs=bs,
             )
+
         if self._block_accept_recorder is not None and not proposal_folded:
             self._block_accept_recorder.observe_verify_step(
                 forward_ct=forward_ct,
@@ -899,6 +918,8 @@ class DsparkStepObservers:
                 prefix_lens=prefix_lens,
                 layout=layout,
             )
+
+        # record sps
         if self._info_dumper.enabled:
             budget_decision = planner.take_budget_decision()
             predicted_step_ms = (
@@ -915,6 +936,7 @@ class DsparkStepObservers:
                 if layout is not None
                 else int(verify_ids_2d.numel())
             )
+            # observe
             self._info_dumper.observe_decode_step(
                 DecodeStepObservation(
                     forward_ct=forward_ct,

@@ -173,12 +173,14 @@ def run_profile(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
 ) -> None:
+    # check tokenizer
     if get_tokenizer is None:
         raise RuntimeError(
             "'run' needs the full sglang runtime (torch, tokenizers, ...), but this "
             "process loaded the torch-free fallback. Run 'run' where sglang is "
             "installed; 'fit' works in either environment."
         )
+    # check base_url
     if not base_url:
         raise ValueError(
             "dspark_sps_profiler connects to an already-running DSpark server "
@@ -187,6 +189,7 @@ def run_profile(
         )
 
     offdiag = fracs is not None
+    # check fracs
     if offdiag:
         for frac in fracs:
             if not 0.0 < frac <= 1.0:
@@ -196,18 +199,24 @@ def run_profile(
                     "the full uniform tier and inside the captured cuda graphs."
                 )
 
+    # check paths
     paths = out_paths(out=out)
     paths["table"].parent.mkdir(parents=True, exist_ok=True)
     for path in (paths["records"], paths["rounds"]):
         if path.exists():
             path.unlink()
 
+    # fetch server first
     context = fetch_server_context(
         base_url=base_url,
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
     )
+
+    # get tokenizer
     vocab_size = len(get_tokenizer(context.tokenizer_path))
+
+    # validate bs
     batch_sizes = sorted(set(batch_sizes))
     validate_sweep_against_server(context=context, batch_sizes=batch_sizes)
     rng = random.Random(PROFILE_SEED)
@@ -436,6 +445,7 @@ def fetch_server_context(
     if not internal_states:
         raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
 
+    # get sps payloads
     sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
 
     for rank_index, payload in enumerate(sps_payloads):
@@ -655,6 +665,7 @@ def run_one_round(
     ]  # len = len(internal states)
 
     start_time = time.monotonic()
+    # create a thread sending a batch requests (bs, input_len), output_len
     load_thread = start_load(
         base_url=context.base_url,
         num_requests=batch_size,
@@ -672,8 +683,10 @@ def run_one_round(
         min_steady_seconds=settings.min_steady_seconds,
         timeout_seconds=settings.round_timeout_seconds,
     )
-    abort_all_requests(base_url=context.base_url)
-    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)  # wait 60s
+    abort_all_requests(base_url=context.base_url)  # abort all
+
+    # join the sending thread
+    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
     if load_thread.is_alive():
         logger.warning(
             "Load batch for bs=%s did not return within %.0fs after abort; "
@@ -681,6 +694,7 @@ def run_one_round(
             batch_size,
             LOAD_JOIN_TIMEOUT_SECONDS,
         )
+
     wall_seconds = time.monotonic() - start_time
 
     if not reached_target:
@@ -733,6 +747,7 @@ def start_load(
     token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
     if token_high <= RANDOM_TOKEN_LOW:
         raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
+
     input_ids = [
         [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
         for _ in range(num_requests)

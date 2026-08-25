@@ -606,6 +606,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
         )
 
+        # draft
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
@@ -679,6 +680,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
+
+        # target verify
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -764,6 +767,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
+        #
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,

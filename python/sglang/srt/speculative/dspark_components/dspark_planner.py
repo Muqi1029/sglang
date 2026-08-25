@@ -155,17 +155,23 @@ class DSparkVerifyPlanner:
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
             )
+
+            # default 2
             relay_lag_steps = (
                 0
                 if get_schedule().disable_overlap_schedule
                 else CONFIDENCE_RELAY_RING_LAG
             )
+
+            # create budget planner
             self._budget_planner = HostConfidenceBudgetPlanner(
                 sps_table=sps_table,
                 cfg=self._schedule_cfg,
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
             )
+
+            # consider dp
             self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
@@ -432,6 +438,7 @@ class DSparkVerifyPlanner:
                     tier_num_reqs=global_num_reqs,
                 )
             return self._uniform_layout_cache[key]
+
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -1126,6 +1133,7 @@ def build_sps_cost_table(
     sps_table_path = server_args.speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)
+    # for unintialized_sps_table (fake)
     max_batch_tokens = max(
         1,
         int(get_schedule().max_running_requests or 1) * verify_num_draft_tokens,
