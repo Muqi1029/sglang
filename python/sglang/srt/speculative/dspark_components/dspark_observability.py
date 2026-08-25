@@ -159,13 +159,13 @@ class DsparkInfoDumper:
         *,
         components: set[Union[InfoComponent, str]],
         gamma: int,
-        verify_num_draft_tokens: int,
+        verify_num_draft_tokens: int,  # gemma + 1
         attn_tp_rank: int,
         device: torch.device,
-        mode_value: str,
+        mode_value: str,  # compact | static | cap_accept
         sps_report_interval: int = 0,
-        max_records: int = INFO_DUMP_MAX_RECORDS,
-        max_step_cpu_seconds: float = INFO_DUMP_MAX_STEP_CPU_SECONDS,
+        max_records: int = INFO_DUMP_MAX_RECORDS,  # 200_000
+        max_step_cpu_seconds: float = INFO_DUMP_MAX_STEP_CPU_SECONDS,  # 1.0
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.gamma = int(gamma)
@@ -179,22 +179,29 @@ class DsparkInfoDumper:
         self._components: set[InfoComponent] = {
             InfoComponent(component) for component in components
         }
+
+        # report
         self._sps_report_interval = int(sps_report_interval)
         if self._sps_report_interval > 0:
+            # if set, add step_gpu_time
             self._components.add(InfoComponent.STEP_GPU_TIME)
+
         # Dedup within an attention-TP group only: records describe the
         # DP-rank-local batch, so under dp-attention every DP rank must keep
         # dumping (the SPS profiler reads one payload per DP rank).
         self.enabled = bool(self._components) and self.attn_tp_rank == 0
+
         self._sps_window: list[tuple[float, float]] = []
         self._sps_mismatched = 0
 
         self._records: deque[DecodeStepRecord] = deque(maxlen=max_records)
         self._pending: Optional[_PendingStep] = None
+
         self._prev_stamp: Optional[float] = None
 
         self._d2h_stream: Optional[torch.cuda.Stream] = None
         if self.enabled and InfoComponent.REQS in self._components:
+            # if reqs, add d2h cuda stream
             self._d2h_stream = torch.cuda.Stream(device=device)
 
         self._current_segments: dict[
@@ -339,6 +346,9 @@ class DsparkInfoDumper:
 
         record = DecodeStepRecord(forward_ct=pending.forward_ct)
         if InfoComponent.CORE in self._components:
+            # bs, mode, budget, lag_stpes, num_running_reqs
+            # num_verify_tokens, verify_tokens_local, verify_tokens_dp_synced
+            # predicted_step_ms, predicted_theta
             record.bs = pending.bs
             record.mode = pending.mode
             record.budget = pending.budget
@@ -368,6 +378,8 @@ class DsparkInfoDumper:
             pending.future.wait()
 
         self._records.append(record)
+
+        # maybe report
         if self._sps_report_interval > 0:
             self._report_sps_prediction(pending=pending, step_gpu_ms=record.step_gpu_ms)
 
@@ -790,9 +802,12 @@ class DsparkStepObservers:
     # --- scheduler-facing hooks ------------------------------------------
 
     def dump_info_records(self) -> Optional[dict]:
+        # proxy for _info_dumper.dump
         dumped = self._info_dumper.dump()
         if dumped is None:
             return None
+
+        # add simulate_acc_len
         dumped["simulate_acc_len"] = (
             self._simulate_acc_len if self._simulate_acc_len > 0 else None
         )

@@ -11,13 +11,18 @@ Covers three things:
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER
+from sglang.srt.models.qwen3_5 import (
+    QWEN3_5_KV_SCALE_MAPPER,
+    _maybe_enable_silu_fp4_quant_fusion,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -151,6 +156,21 @@ class TestQwen3_5KvScaleMapper(CustomTestCase):
         weight_loader(scale_param, loaded_weight)
 
         self.assertAlmostEqual(scale_param.item(), 0.0347, places=6)
+
+
+class TestQwen3_5Fp4FusionBackend(CustomTestCase):
+    def test_silu_fp4_fusion_is_disabled_for_marlin(self):
+        # Marlin receives BF16/FP16 activations and cannot consume the tuple
+        # returned by FlashInfer's fused SiLU+FP4 quantizer.
+        mlp = SimpleNamespace()
+        with patch(
+            "sglang.srt.models.qwen3_5.get_fp4_gemm_runner_backend"
+        ) as get_backend:
+            get_backend.return_value.is_marlin.return_value = True
+            _maybe_enable_silu_fp4_quant_fusion(mlp)
+
+        self.assertFalse(hasattr(mlp, "_enable_silu_fp4_quant_fusion"))
+        self.assertFalse(hasattr(mlp, "down_proj"))
 
 
 if __name__ == "__main__":

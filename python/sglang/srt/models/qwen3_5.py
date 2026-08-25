@@ -66,6 +66,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -167,6 +168,11 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
     """
     if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
+        return
+    # The fused kernel returns a prequantized (fp4, scale) tuple. Marlin's
+    # dense linear op only accepts BF16/FP16 activations, so keep the regular
+    # SiLU + quantization path when Marlin is selected.
+    if get_fp4_gemm_runner_backend().is_marlin():
         return
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 

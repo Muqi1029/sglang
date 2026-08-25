@@ -631,6 +631,7 @@ def run_one_round(
 ) -> Optional[RoundOutcome]:
     batch_size = batch_size_per_rank * context.dp_size
     max_new_tokens = round_max_new_tokens(settings=settings)
+
     if should_skip_due_to_max_running_requests(
         batch_size, context.skip_max_running_requests_threshold
     ) or should_skip_due_to_token_capacity(
@@ -644,11 +645,14 @@ def run_one_round(
     if frac is not None:
         set_forced_budget_frac(base_url=context.base_url, frac=frac)
 
+    # fluash_cache
     flush_cache(base_url=context.base_url)
+
+    # find the largest forward_ct
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
         for rows in fetch_rank_rows(base_url=context.base_url)
-    ]
+    ]  # len = len(internal states)
 
     start_time = time.monotonic()
     load_thread = start_load(
@@ -669,7 +673,7 @@ def run_one_round(
         timeout_seconds=settings.round_timeout_seconds,
     )
     abort_all_requests(base_url=context.base_url)
-    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
+    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)  # wait 60s
     if load_thread.is_alive():
         logger.warning(
             "Load batch for bs=%s did not return within %.0fs after abort; "
@@ -678,6 +682,7 @@ def run_one_round(
             LOAD_JOIN_TIMEOUT_SECONDS,
         )
     wall_seconds = time.monotonic() - start_time
+
     if not reached_target:
         logger.warning(
             "Round bs=%s hit the %.0fs timeout before both gates (>=%s steady "
@@ -724,6 +729,7 @@ def start_load(
     vocab_size: int,
     rng: random.Random,
 ) -> threading.Thread:
+    # input_ids: [RANDOM_TOKEN_LOW, vocab_size - RANDOM_TOKEN_HIGH_MARGIN]
     token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
     if token_high <= RANDOM_TOKEN_LOW:
         raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
@@ -1423,6 +1429,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Sampling temperature for the load requests; default 1.0 to hit "
         "the same accept/sampling kernels as real serving.",
     )
+
     parser.add_argument(
         "--min-steady-steps",
         type=int,
@@ -1440,6 +1447,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "(and --min-steady-steps) has elapsed. Bounds expensive large-batch "
         "rounds, where a fixed step count would run many slow steps.",
     )
+
     parser.add_argument(
         "--round-timeout",
         type=float,
@@ -1457,6 +1465,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "full-batch alignment becomes unreachable; size it as roughly "
         "ramp_seconds / step_time.",
     )
+
     parser.add_argument(
         "--repeats",
         type=int,
@@ -1464,6 +1473,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Times to repeat the whole sweep; per batch_tokens the median "
         "steps_per_sec across repeats is taken.",
     )
+
     parser.add_argument(
         "--local-tokenizer-path",
         type=str,
