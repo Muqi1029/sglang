@@ -96,6 +96,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.full_segment_reps_group = []
+        self.swa_segment_reps_group = []
+        self.swa_live_segment_reps_group = []
 
         self._kvcache = kvcache
         self.clear()
@@ -329,6 +332,43 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free a contiguous request segment without deduplicating all tokens.
+
+        The full side can release one representative per page directly. The SWA
+        side snapshots the mapped slots before the group flush because cache
+        reconciliation may replace mappings in the meantime. Tombstoned slots
+        remain zero and are filtered when the group is released.
+        """
+        if free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free(free_index)
+            return
+
+        ps = self.page_size
+        offset = start_pos % ps
+        if offset == 0:
+            pieces = (free_index[::ps],)
+        else:
+            pieces = (free_index[:1], free_index[ps - offset :: ps])
+        full_reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+
+        swa_reps = self._take_swa_page_reps(full_reps)
+
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free_page_reps(full_reps)
+            self.swa_attn_allocator.free_page_reps(swa_reps[swa_reps > 0])
+        else:
+            self.full_segment_reps_group.append(self._copy_for_free_group(full_reps))
+            # Advanced indexing owns its storage, unlike the request-row view.
+            self.swa_segment_reps_group.append(swa_reps)
+
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -349,6 +389,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
         # host-resident scalar and blocks until the stream drains.
         self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
+
+    def _take_swa_page_reps(self, full_reps: torch.Tensor) -> torch.Tensor:
+        """Snapshot SWA representatives and clear their full mapping pages."""
+        full_reps = full_reps.to(torch.int64)
+        swa_reps = self.full_to_swa_index_mapping[full_reps]
+        page_starts = (full_reps // self.page_size) * self.page_size
+        page_offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=full_reps.device
+        )
+        mapping_indices = (page_starts[:, None] + page_offsets[None, :]).reshape(-1)
+        self.clear_full_to_swa_mapping(mapping_indices)
+        return swa_reps
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free a live, page-aligned SWA-only segment without unique."""
+        if free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free_swa(free_index)
+            return
+
+        assert start_pos % self.page_size == 0
+        full_reps = free_index[:: self.page_size]
+        swa_reps = self._take_swa_page_reps(full_reps)
+        if not self.is_not_in_free_group:
+            self.swa_live_segment_reps_group.append(swa_reps)
+            return
+        self.swa_attn_allocator.free_page_reps(swa_reps)
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -374,9 +442,35 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
+        self.full_segment_reps_group = []
+        self.swa_segment_reps_group = []
+        self.swa_live_segment_reps_group = []
 
     def free_group_end(self):
-        super().free_group_end()
+        if self.full_segment_reps_group:
+            # Do not call BaseTokenToKVPoolAllocator.free_group_end here: it
+            # would concatenate token indices and re-enter free()/unique().
+            self.is_not_in_free_group = True
+            if self.free_group:
+                legacy_group = self.free_group
+                self.free_group = []
+                self.free(torch.cat(legacy_group))
+            full_segment_reps_group = self.full_segment_reps_group
+            self.full_segment_reps_group = []
+            self.full_attn_allocator.free_page_reps(torch.cat(full_segment_reps_group))
+        else:
+            super().free_group_end()
+        if self.swa_segment_reps_group:
+            swa_segment_reps_group = self.swa_segment_reps_group
+            self.swa_segment_reps_group = []
+            swa_reps = torch.cat(swa_segment_reps_group)
+            self.swa_attn_allocator.free_page_reps(swa_reps[swa_reps > 0])
+        if self.swa_live_segment_reps_group:
+            swa_live_segment_reps_group = self.swa_live_segment_reps_group
+            self.swa_live_segment_reps_group = []
+            self.swa_attn_allocator.free_page_reps(
+                torch.cat(swa_live_segment_reps_group)
+            )
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
@@ -411,6 +505,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.full_segment_reps_group = []
+        self.swa_segment_reps_group = []
+        self.swa_live_segment_reps_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -510,6 +607,13 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        # full == swa and the identity mapping must never be cleared.
+        self.free(free_index)
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        self.free_swa(free_index)
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

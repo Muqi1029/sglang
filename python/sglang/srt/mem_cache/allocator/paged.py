@@ -293,13 +293,20 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.unique(free_index.cpu() // ps),
             )
 
+        self.free_page_reps(*pieces)
+
+    def free_page_reps(self, *page_reps: torch.Tensor):
+        """Release already-deduplicated page representatives without unique."""
+        if not page_reps:
+            return
+
         if self.is_not_in_free_group:
-            self._release_page_ids(*(p // ps for p in pieces))
+            self._release_page_ids(*(p // self.page_size for p in page_reps))
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
             self.free_page_reps_group.extend(
-                self._copy_for_free_group(piece) for piece in pieces
+                self._copy_for_free_group(piece) for piece in page_reps
             )
 
     def _debug_check_no_duplicate_pages(self):

@@ -130,6 +130,21 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         data-dependent dedup. Default: plain free()."""
         self.free(free_index)
 
+    def free_page_reps(self, *page_reps: torch.Tensor):
+        """Free indices containing one representative per physical page.
+
+        Paged allocators override this to skip the data-dependent dedup in
+        ``free()``. For token allocators a representative is the allocation
+        itself, so the default can use the regular free path.
+        """
+        if not page_reps:
+            return
+        self.free(page_reps[0] if len(page_reps) == 1 else torch.cat(page_reps))
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """SWA-only counterpart of free_segment; defaults to regular free_swa."""
+        self.free_swa(free_index)
+
     def free_segments(self, segments):
         """Free disjoint ascending ``(free_index, start_pos)`` segments of one
         request's kv row; a boundary page shared by consecutive segments is

@@ -2458,6 +2458,15 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.full_attn_allocator.clear_inverse_history()
             self.swa_attn_allocator.clear_inverse_history()
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        # This allocator's virtual-to-physical tables are the mapping. Keep its
+        # tombstone-aware free path instead of inheriting the static SWA mapping
+        # implementation.
+        self.free(free_index)
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        self.free_swa(free_index)
+
     def free_swa(self, free_index: torch.Tensor) -> None:
         """SWA tombstone path: release swa-physical, leave virtual id and
         full-physical live. Called by `SWARadixCache._evict_swa_only` when a node
