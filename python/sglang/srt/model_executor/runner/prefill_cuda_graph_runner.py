@@ -1474,6 +1474,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "limits; the graph would read stale LoRA metadata at replay."
             )
             lora_manager.prepare_lora_batch(forward_batch)
+
         shape_key = ShapeKey(
             size=num_tokens,
             variant_label=(

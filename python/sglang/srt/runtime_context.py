@@ -1568,7 +1568,9 @@ def _dump_recorded_namespace_reads() -> None:
         )
 
 
-def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
+def publish(
+    server_args: ServerArgs, *, role: str, hf_config: Any = None
+) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
     Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,

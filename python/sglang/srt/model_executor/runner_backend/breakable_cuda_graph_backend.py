@@ -115,6 +115,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        # warmup
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()

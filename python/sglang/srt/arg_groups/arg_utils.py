@@ -166,6 +166,7 @@ def namespace_of(cls) -> dict:
             out.setdefault(name, path)
     if len(out) == len(record_fields(cls)):
         return out
+
     hints = get_type_hints(cls, include_extras=True)
     for field in record_fields(cls):
         if field.name in out:

@@ -56,7 +56,11 @@ def collect_input_fields(
                     f"{annotations[field.name][0].__name__} and {source.__name__}; "
                     "a field belongs to exactly one namespace"
                 )
+            # set true types
+            # value (cls, )
             annotations[field.name] = (source, hints[field.name])
+
+            # collect defaults
             if field.default is not msgspec.NODEFAULT:
                 defaults[field.name] = field.default
             elif field.default_factory is not msgspec.NODEFAULT:
