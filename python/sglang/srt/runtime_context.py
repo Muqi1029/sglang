@@ -883,7 +883,9 @@ def _build_config_bags(server_args: Any) -> dict:
         parts = path.split(".")
         bag = tops.get(parts[0])
         if bag is None:
+            # create top bag
             bag = tops[parts[0]] = _ConfigBag(parts[0])
+
         for depth in range(1, len(parts)):
             name = parts[depth]
             if name in object.__getattribute__(bag, "_fields"):
@@ -894,14 +896,18 @@ def _build_config_bags(server_args: Any) -> dict:
             subs = object.__getattribute__(bag, "_subs")
             child = subs.get(name)
             if child is None:
+                # create a sub _ConfigBag (named like exec.graph)
                 child = _ConfigBag(".".join(parts[: depth + 1]))
                 bag._set_sub(name, child)
             bag = child
+
         if field in object.__getattribute__(bag, "_subs"):
             raise ValueError(
                 f"config namespace collision: leaf {field!r} under {path!r} "
                 "clashes with a subgroup of the same name"
             )
+
+        # set field in the leaf bag
         bag._set(field, value)
     _install_derived_leaves(tops, server_args)
     return tops
@@ -934,10 +940,12 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
         path = getattr(source, "_NS_PATH", None)
         if path is None:
             continue
+
         for name, decl in vars(source).items():
             if not isinstance(decl, Derived) or not decl.fn:
                 continue
             module, _, attr = decl.fn.rpartition(".")
+
             bag = tops.get(path.split(".")[0])
             for segment in path.split(".")[1:]:
                 bag = bag and getattr(bag, segment, None)

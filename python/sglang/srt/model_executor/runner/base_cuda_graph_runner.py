@@ -90,6 +90,7 @@ def get_batch_sizes_to_capture(
     # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * alignment_width % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
+
     capture_bs = list(sorted(set(capture_bs)))
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"

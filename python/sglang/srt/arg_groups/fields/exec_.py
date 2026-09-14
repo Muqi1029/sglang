@@ -465,6 +465,7 @@ class ExecGraph(msgspec.Struct):
             type_parser=parse_cuda_graph_config_arg,
         ),
     ] = None
+
     cuda_graph_backend_decode: A[
         Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
         Arg(
@@ -479,12 +480,14 @@ class ExecGraph(msgspec.Struct):
             choices=Backend.ALL,
         ),
     ] = None
+
     cuda_graph_max_bs_decode: A[
         Optional[int], "Maximum batch size captured for the decode cuda graph."
     ] = None
     cuda_graph_max_bs_prefill: A[
         Optional[int], "Maximum batch size captured for the prefill cuda graph."
     ] = None
+
     cuda_graph_bs_decode: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the decode cuda graph.",
@@ -493,10 +496,12 @@ class ExecGraph(msgspec.Struct):
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
     ] = None
+
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
         "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
     ] = None
+
     disable_prefill_cuda_graph: A[
         bool,
         "Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
@@ -505,15 +510,18 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
     ] = False
+
     disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
     ] = False
+
     enable_profile_cuda_graph: A[
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",

@@ -120,6 +120,7 @@ class EagerRunner(BaseRunner):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= get_spec().speculative_eagle_topk
+
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         max_bs = get_eager_max_batch_size(max_bs)
         prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())

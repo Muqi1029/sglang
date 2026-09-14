@@ -44,11 +44,13 @@ def parse_cuda_graph_config(server_args: Any):
     backend skips the cascade, whichever value it is).
     """
     cfg = resolving_view(server_args)
+
     raw_input = cfg.cuda_graph_config
     if isinstance(raw_input, CudaGraphConfig):
         explicit_input = raw_input.to_dict()
     else:
         explicit_input = raw_input or {}
+
     config = default_cuda_graph_config()
     locked: set = set()
 
@@ -74,14 +76,17 @@ def parse_cuda_graph_config(server_args: Any):
         _set(Phase.DECODE, "backend", cfg.cuda_graph_backend_decode)
     if cfg.cuda_graph_backend_prefill is not None:
         _set(Phase.PREFILL, "backend", cfg.cuda_graph_backend_prefill)
+
     if cfg.cuda_graph_max_bs_decode is not None:
         _set(Phase.DECODE, "max_bs", cfg.cuda_graph_max_bs_decode)
     if cfg.cuda_graph_max_bs_prefill is not None:
         _set(Phase.PREFILL, "max_bs", cfg.cuda_graph_max_bs_prefill)
+
     if cfg.cuda_graph_bs_decode is not None:
         _set(Phase.DECODE, "bs", cfg.cuda_graph_bs_decode)
     if cfg.cuda_graph_bs_prefill is not None:
         _set(Phase.PREFILL, "bs", cfg.cuda_graph_bs_prefill)
+
     if cfg.cuda_graph_tc_compiler is not None:
         # Written to both phases so the value is in place when TC_PIECEWISE
         # decode is implemented; today decode ignores it.
