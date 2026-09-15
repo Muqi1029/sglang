@@ -1552,3 +1552,5 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
+        """_summary_
+        """
