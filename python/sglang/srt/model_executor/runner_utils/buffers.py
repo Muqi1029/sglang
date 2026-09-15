@@ -242,12 +242,16 @@ class PrefillInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
     num_token_non_padded: torch.Tensor
+
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     mamba_track_seqlens: Optional[torch.Tensor]
+
     positions: torch.Tensor
+
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
 
     @classmethod

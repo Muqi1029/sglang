@@ -1028,6 +1028,8 @@ class ModelRunner:
         self.prefill_attention_backend_str = resolved.prefill
         self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)
+
+        # unwrap the dataclass, set them to backends
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group

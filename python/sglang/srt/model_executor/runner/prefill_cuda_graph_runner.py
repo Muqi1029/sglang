@@ -387,13 +387,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
+        # attn
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
+
+        # moe
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+
+        # dsa
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         self.dp_size = get_parallel().dp_size
