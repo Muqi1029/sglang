@@ -1660,8 +1660,24 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 if self.is_w4a16
                 else ModelOptFp4LinearMethod
             ),
-            Moe=ModelOptNvFp4FusedMoEMethod,
+            Moe=lambda cfg: make_nvfp4_fused_moe_method(cfg, prefix),
         )
+
+
+def make_nvfp4_fused_moe_method(quant_config: ModelOptFp4Config, prefix: str = ""):
+    """NVFP4 FusedMoE method for the selected ``--moe-runner-backend``.
+
+    ``humming`` routes the packed NVFP4 experts through the Humming grouped GEMM
+    (W4A8 on SM90 / Hopper); every other backend keeps the stock
+    ``ModelOptNvFp4FusedMoEMethod`` dispatch.
+    """
+    if get_moe_runner_backend().is_humming():
+        from sglang.srt.layers.quantization.nvfp4_humming_moe import (
+            ModelOptNvFp4HummingMoEMethod,
+        )
+
+        return ModelOptNvFp4HummingMoEMethod(quant_config, prefix=prefix)
+    return ModelOptNvFp4FusedMoEMethod(quant_config)
 
 
 class HybridFp8NvFp4Config(Fp8Config):
@@ -1687,7 +1703,7 @@ class HybridFp8NvFp4Config(Fp8Config):
 
         if isinstance(layer, FusedMoE):
             if not self.nvfp4_config.is_layer_excluded(prefix):
-                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+                return make_nvfp4_fused_moe_method(self.nvfp4_config, prefix)
             # Fall back to MXFP4 for MTP MoE layers
             if self.is_fp4_experts:
                 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
@@ -2310,11 +2326,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not get_platform().is_blackwell and not use_marlin_fallback:
+        # Humming dequantizes NVFP4 experts in-kernel (W4A8 on SM90), so it is
+        # a valid pre-Blackwell backend as well; see ModelOptNvFp4HummingMoEMethod.
+        use_humming = moe_runner_backend.is_humming()
+        if (
+            not get_platform().is_blackwell
+            and not use_marlin_fallback
+            and not use_humming
+        ):
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
-                "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
+                "Blackwell and above, or use moe_runner_backend=marlin/humming on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -2441,11 +2464,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
+        # swizzle+allocate here to avoid GPU memory fragmentation. Humming
+        # (and Marlin) repack w*_weight_scale themselves and never read it.
+        skip_swizzled = (
             self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+            or get_moe_runner_backend().is_humming()
+            or get_moe_runner_backend().is_marlin()
+        )
+        if skip_swizzled:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2465,10 +2492,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+        if skip_swizzled:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(

@@ -1210,13 +1210,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        # Plain modelopt_fp4, or the FP8 + NVFP4 hybrid (HybridFp8NvFp4Config)
+        # whose NVFP4 exclude list lives on ``nvfp4_config``.
+        nvfp4_config = None
+        if quant_config is not None:
+            if quant_config.get_name() == "modelopt_fp4":
+                nvfp4_config = quant_config
+            else:
+                nvfp4_config = getattr(quant_config, "nvfp4_config", None)
+        if nvfp4_config is not None:
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
                 moe_prefix = f"model.layers.{layer_id}.mlp"
-                if quant_config.is_layer_excluded(
+                if nvfp4_config.is_layer_excluded(
                     f"{moe_prefix}.shared_experts"
-                ) and not quant_config.is_layer_excluded(f"{moe_prefix}.experts"):
+                ) and not nvfp4_config.is_layer_excluded(f"{moe_prefix}.experts"):
                     return (
                         "ModelOpt FP4 keeps shared experts unquantized while routed "
                         "experts are quantized."

@@ -226,11 +226,13 @@ def _get_quantization_config(
                     ModelOptFp4Config,
                 )
 
-                # Draft experts serialized under mtp.* remain source MXFP4.
-                # NextN exposes them as model.decoder.*; DSpark as stages.*.
-                nvfp4_exclude_modules = list(
-                    nvfp4_meta.get("exclude_modules") or []
-                ) + ["model.decoder.*", "stages.*"]
+                # DeepSeek-V4 draft experts serialized under mtp.* remain source
+                # MXFP4 (NextN exposes them as model.decoder.*; DSpark as
+                # stages.*). Other hybrid checkpoints (e.g. GLM-5.3-Flash) keep
+                # NVFP4 experts in the MTP layer, so only exclude them for DSV4.
+                nvfp4_exclude_modules = list(nvfp4_meta.get("exclude_modules") or [])
+                if is_deepseek_v4(model_config.hf_config):
+                    nvfp4_exclude_modules += ["model.decoder.*", "stages.*"]
                 nvfp4_config = ModelOptFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=int(nvfp4_meta["group_size"]),
