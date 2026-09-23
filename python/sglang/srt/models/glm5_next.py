@@ -45,6 +45,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1243,6 +1244,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "Shared experts fusion is not supported when Deepep MoE backend "
                 "is enabled."
             )
+        if (
+            get_moe_runner_backend().is_marlin()
+            or get_moe_runner_backend().is_humming()
+        ):
+            return "Disable Shared experts fusion when using humming or marlin"
         return None
 
     def determine_num_fused_shared_experts(self):
