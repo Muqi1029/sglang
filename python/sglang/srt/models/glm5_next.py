@@ -1398,7 +1398,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             get_moe_runner_backend().is_marlin()
             or get_moe_runner_backend().is_humming()
         ):
-            return "Disable Shared experts fusion when using humming or marlin"
+            return "Shared experts fusion is incompatible with humming or marlin."
         return None
 
     def determine_num_fused_shared_experts(self):
