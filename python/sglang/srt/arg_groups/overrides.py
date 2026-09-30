@@ -527,8 +527,15 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    nope_group_scaled: bool = False,
+    dcp_size: int = 1,
 ) -> None:
-    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    """Validate DSA backend / platform / kv-cache-dtype constraints.
+
+    ``nope_group_scaled`` marks a BF16 model whose MLA cache has no RoPE part
+    and a 128-aligned latent, i.e. one whose fp8 rows are the group-scaled
+    NoPE layout the CUDA TileLang kernel consumes.
+    """
     chosen = {prefill_backend, decode_backend}
 
     rocm_only = {"triton"} & chosen
@@ -539,14 +546,23 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    cuda_fp8_unsupported = {"tilelang"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+    cuda_fp8_tilelang = {"tilelang"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_tilelang:
+        # Both phases must read the same group-scaled NoPE rows; any other
+        # prefill/decode consumer expects a RoPE tail or a different layout.
+        if (
+            nope_group_scaled
+            and prefill_backend == decode_backend == "tilelang"
+            and dcp_size == 1
+        ):
+            return
         raise ValueError(
-            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
-            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
-            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "On CUDA, the tilelang DSA kernels accept an fp8_e4m3 KV cache only "
+            "for BF16 NoPE models (qk_rope_head_dim == 0, kv_lora_rank a multiple "
+            "of 128) with both --dsa-prefill-backend and --dsa-decode-backend set "
+            "to tilelang and --dcp-size 1. Otherwise use --kv-cache-dtype "
+            "bfloat16, or pick an fp8-capable DSA backend (flashmla_kv on Hopper, "
+            "trtllm on Blackwell)."
         )
 
 
@@ -688,8 +704,20 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    model_config = model_config_of(view)
+    kv_lora_rank = getattr(model_config, "kv_lora_rank", None)
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        nope_group_scaled=(
+            getattr(model_config, "qk_rope_head_dim", None) == 0
+            and isinstance(kv_lora_rank, int)
+            and kv_lora_rank % 128 == 0
+            and getattr(model_config, "dtype", None) == torch.bfloat16
+        ),
+        dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

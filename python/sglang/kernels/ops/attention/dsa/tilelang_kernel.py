@@ -430,6 +430,204 @@ def sparse_attention_fwd_kernel_v1(
 
 
 @tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd_partial_fp8_group_scaled(
+    num_heads,
+    dim,
+    topk,
+    *,
+    group_size=128,
+    sm_scale=None,
+    block_I=64,
+    inner_iter=1,
+    num_stages=2,
+    threads=256,
+):
+    """Split-K NoPE sparse MLA over group-scaled FP8 KV rows.
+
+    Each KV row is the layout written by ``quantize_k_cache_separate``:
+    ``dim`` FP8 values followed by one FP32 scale per ``group_size`` values.
+    Gathered rows are dequantized to BF16 in shared memory, so Q, both GEMMs
+    and the softmax run in BF16/FP32 as in ``sparse_attention_fwd_kernel_v1``
+    while HBM traffic stays FP8.
+
+    grid: (seq_len * REPLICATE_H, ceil(topk / block_I / inner_iter)). Each block
+    reduces ``inner_iter`` KV tiles into one normalized ``(partial_o,
+    partial_lse)`` entry for ``sparse_mla_fwd_decode_combine``; tiles past
+    ``topk`` in the last split are fully masked.
+    """
+    assert dim % group_size == 0, f"dim={dim} must be a multiple of {group_size}"
+    assert topk % block_I == 0, (
+        "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    )
+    if sm_scale is None:
+        sm_scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
+    else:
+        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    batch = 1
+    kv_group = 1
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
+    num_scales = dim // group_size
+    row_width = dim + num_scales * 4
+    scale_offset = dim // 4
+
+    NI = topk // block_I
+    N_GROUPS = tilelang.cdiv(NI, inner_iter)
+    q_shape = [batch, seq_len, num_heads, dim]
+    kv_shape = [batch, seq_len_kv, kv_group, row_width]
+    kv_scale_shape = [batch, seq_len_kv, kv_group, row_width // 4]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    partial_o_shape = [batch, seq_len, N_GROUPS, num_heads, dim]
+    partial_lse_shape = [batch, seq_len, N_GROUPS, num_heads]
+    indices_dtype = "int32"
+    dtype = "bfloat16"
+    accum_dtype = "float"
+
+    padded_H = max(tilelang.math.next_power_of_2(num_heads), 16)
+    BI = block_I
+    D = dim
+
+    if num_heads > 64:
+        assert num_heads % 64 == 0, "num_heads should be a multiple of 64"
+        REPLICATE_H = num_heads // 64
+    else:
+        REPLICATE_H = 1
+
+    H_per_block = padded_H if REPLICATE_H == 1 else 64
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, FP8),  # type: ignore
+        KV_scale: T.Tensor(kv_scale_shape, FP32),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Partial_O: T.Tensor(partial_o_shape, dtype),  # type: ignore
+        Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, N_GROUPS, threads=threads) as (bx, by):
+            Q_shared = T.alloc_shared([H_per_block, D], dtype)
+            KV_fp8_shared = T.alloc_shared([BI, D], FP8)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            scale_shared = T.alloc_shared([BI, num_scales], accum_dtype)
+            valid_shared = T.alloc_shared([BI], "bool")
+            mask = T.alloc_fragment([BI], "bool")
+
+            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+
+            b_i, g_i = 0, 0
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            group_i = by
+
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+
+            for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
+                base = (group_i * inner_iter + k_i) * BI
+                # Payload and scale gathers stay pure copies addressed straight
+                # from Indices, so they form the async producer stage; an
+                # address staged through shared memory would race its own copy.
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_fp8_shared[bi_i, d_i] = KV[
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, T.min(base + bi_i, topk - 1)], 0),
+                        g_i,
+                        d_i,
+                    ]
+                for bi_i, g in T.Parallel(BI, num_scales):
+                    scale_shared[bi_i, g] = KV_scale[
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, T.min(base + bi_i, topk - 1)], 0),
+                        g_i,
+                        scale_offset + g,
+                    ]
+
+                for bi_i in T.Parallel(BI):
+                    valid = (base + bi_i < topk) & (
+                        Indices[b_i, s_i, g_i, T.min(base + bi_i, topk - 1)] >= 0
+                    )
+                    mask[bi_i] = valid
+                    valid_shared[bi_i] = valid
+                # Masked slots read row 0, and an all-zero group stores scale 0
+                # over a NaN payload (amax / 448 == 0). Neither may reach the
+                # PV GEMM, where a NaN row survives a zero softmax weight.
+                for bi_i, d_i in T.Parallel(BI, D):
+                    scale = scale_shared[bi_i, d_i // group_size]
+                    KV_shared[bi_i, d_i] = T.if_then_else(
+                        valid_shared[bi_i] & (scale != 0),
+                        T.Cast(
+                            dtype,
+                            T.Cast(accum_dtype, KV_fp8_shared[bi_i, d_i]) * scale,
+                        ),
+                        T.Cast(dtype, 0),
+                    )
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+                T.gemm(
+                    Q_shared,
+                    KV_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+
+            # sumexp==0 (all masked): write 0 and an LSE the combine ignores.
+            for h_i, d_i in T.Parallel(H_per_block, D):
+                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                )
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.if_then_else(
+                    sumexp[h_i] == 0.0,
+                    -(2**30),
+                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                )
+            T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :])
+            T.copy(sumexp, Partial_Lse[b_i, s_i, group_i, H0:H1])
+
+    return main
+
+
+@tilelang.jit(
     out_idx=[-1],
     compile_flags=[
         "-O3",
@@ -1357,6 +1555,34 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+@lru_cache(maxsize=16)
+def _fp8_group_scaled_tile(num_heads: int, dim: int, device: int) -> Tuple[int, int]:
+    """Largest (block_I, threads) whose two staged FP8 row tiles, BF16 KV tile,
+    Q tile and score tile fit the device's opt-in shared memory."""
+    smem_limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    heads = min(max(tilelang.math.next_power_of_2(num_heads), 16), 64)
+    for block_I, threads in ((64, 256), (32, 128)):
+        staged = 2 * block_I * (dim + dim // 128 * 4)
+        if staged + 2 * (block_I * dim + heads * dim + heads * block_I) <= smem_limit:
+            return block_I, threads
+    return 32, 128
+
+
+@lru_cache(maxsize=256)
+def _fp8_group_scaled_split(ctas: int, ni: int, sm_count: int) -> int:
+    """KV tiles per split for ``ctas`` (token, head-block) programs over ``ni``
+    tiles. Minimizes waves * (tiles + 1 fixed cost) at one block per SM; only
+    powers of two (and ``ni``) are tried to bound JIT variants."""
+    candidates = [ni] + [1 << p for p in range(ni.bit_length()) if (1 << p) < ni]
+    best, best_cost = ni, None
+    for inner in candidates:
+        waves = tilelang.cdiv(ctas * tilelang.cdiv(ni, inner), sm_count)
+        cost = waves * (inner + 1)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = inner, cost
+    return best
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1422,6 +1648,54 @@ def tilelang_sparse_fwd(
             threads=threads,
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
+    elif kv.dtype == FP8_DTYPE:
+        num_scales = d_v // 128
+        if (
+            tail_dim != 0
+            or q.dtype != torch.bfloat16
+            or d_v % 128 != 0
+            or kv.shape[-1] != d_v + num_scales * 4
+        ):
+            raise ValueError(
+                "CUDA TileLang FP8 KV expects BF16 NoPE queries and group-scaled "
+                f"rows of {d_v} FP8 values plus {num_scales} FP32 scales; got "
+                f"q={tuple(q.shape)} {q.dtype}, kv={tuple(kv.shape)}, d_v={d_v}"
+            )
+        block_I, threads = _fp8_group_scaled_tile(num_heads, d_v, q.device.index)
+        head_blocks = num_heads // 64 if num_heads > 64 else 1
+        inner_iter = _fp8_group_scaled_split(
+            q.shape[0] * head_blocks,
+            topk // block_I,
+            torch.cuda.get_device_properties(q.device).multi_processor_count,
+        )
+        kernel_partial = sparse_mla_fwd_partial_fp8_group_scaled(
+            num_heads,
+            d_v,
+            topk,
+            sm_scale=sm_scale,
+            block_I=block_I,
+            inner_iter=inner_iter,
+            threads=threads,
+        )
+        partial_o, partial_lse = kernel_partial(
+            q.unsqueeze(0),
+            kv.unsqueeze(0),
+            kv.view(torch.float32).unsqueeze(0),
+            indices.unsqueeze(0),
+        )
+        n_groups = partial_o.shape[2]
+        if n_groups == 1:
+            out = partial_o[:, :, 0]
+        else:
+            kernel_combine = sparse_mla_fwd_decode_combine(
+                num_heads,
+                d_v,
+                n_groups * block_I,
+                head_per_block=4,
+                block_I=block_I,
+                threads=threads,
+            )
+            out = kernel_combine(partial_o, partial_lse)
     else:
         kernel_factory = (
             sparse_attention_fwd_kernel_v1
