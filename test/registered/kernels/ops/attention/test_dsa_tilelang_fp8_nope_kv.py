@@ -96,8 +96,10 @@ class TestTileLangFp8GroupScaledNope(CustomTestCase):
         )
 
         sm_scale = 1.0 / math.sqrt(512)
-        # 1 and 7 tokens split top-k across blocks; 300 tokens run unsplit.
-        for heads, tokens in ((8, 7), (16, 1), (16, 300), (_max_heads_for_device(), 7)):
+        # 1-7 tokens split top-k across blocks; 300 tokens run unsplit. Two heads
+        # (TP32 of 64) merge splits with a 2-head combine tile.
+        cases = ((2, 3), (8, 7), (16, 1), (16, 300), (_max_heads_for_device(), 7))
+        for heads, tokens in cases:
             with self.subTest(heads=heads, tokens=tokens):
                 q, cache, kv_bf16, indices = self._inputs(
                     tokens=tokens, heads=heads, topk=2112, num_rows=4096, seed=heads
@@ -213,6 +215,14 @@ class TestTileLangFp8GroupScaledNope(CustomTestCase):
         self.assert_rel_l2(
             actual, _reference(q, kv_bf16, page_table.unsqueeze(1), sm_scale)
         )
+
+    def test_empty_batch_returns_empty_output(self):
+        """An empty scattered attention slice must not launch a zero-sized grid."""
+        cache, _ = _make_cache(64)
+        q = torch.empty(0, 16, 512, device="cuda", dtype=torch.bfloat16)
+        indices = torch.empty(0, 1, 2112, device="cuda", dtype=torch.int32)
+        out = self._run(q, cache, indices, 1.0 / math.sqrt(512))
+        self.assertEqual(tuple(out.shape), (1, 0, 16, 512))
 
     def test_rejects_non_nope_or_unscaled_rows(self):
         """A raw 512-byte FP8 row or a 656-byte RoPE row must not be misread."""

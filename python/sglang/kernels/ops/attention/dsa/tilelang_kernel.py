@@ -1,4 +1,5 @@
 import functools
+import math
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -1558,12 +1559,15 @@ def sparse_mla_fwd_decode_partial_fp8(
 @lru_cache(maxsize=16)
 def _fp8_group_scaled_tile(num_heads: int, dim: int, device: int) -> Tuple[int, int]:
     """Largest (block_I, threads) whose two staged FP8 row tiles, BF16 KV tile,
-    Q tile and score tile fit the device's opt-in shared memory."""
+    Q tile and score tile fit the device's opt-in shared memory. The 4 KB
+    headroom covers buffer alignment: sm_90a lowers the 64-row tile to exactly
+    2 KB above the sum of the buffers."""
     smem_limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
     heads = min(max(tilelang.math.next_power_of_2(num_heads), 16), 64)
     for block_I, threads in ((64, 256), (32, 128)):
         staged = 2 * block_I * (dim + dim // 128 * 4)
-        if staged + 2 * (block_I * dim + heads * dim + heads * block_I) <= smem_limit:
+        tiles = 2 * (block_I * dim + heads * dim + heads * block_I)
+        if staged + tiles + 4096 <= smem_limit:
             return block_I, threads
     return 32, 128
 
@@ -1661,6 +1665,9 @@ def tilelang_sparse_fwd(
                 f"rows of {d_v} FP8 values plus {num_scales} FP32 scales; got "
                 f"q={tuple(q.shape)} {q.dtype}, kv={tuple(kv.shape)}, d_v={d_v}"
             )
+        if q.shape[0] == 0:
+            # A zero-sized grid is a launch error.
+            return q.new_empty((1, 0, num_heads, d_v))
         block_I, threads = _fp8_group_scaled_tile(num_heads, d_v, q.device.index)
         head_blocks = num_heads // 64 if num_heads > 64 else 1
         inner_iter = _fp8_group_scaled_split(
@@ -1691,7 +1698,7 @@ def tilelang_sparse_fwd(
                 num_heads,
                 d_v,
                 n_groups * block_I,
-                head_per_block=4,
+                head_per_block=math.gcd(num_heads, 4),
                 block_I=block_I,
                 threads=threads,
             )

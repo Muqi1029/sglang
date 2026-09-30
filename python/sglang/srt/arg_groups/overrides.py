@@ -560,9 +560,9 @@ def _check_dsa_backend_constraints(
             "On CUDA, the tilelang DSA kernels accept an fp8_e4m3 KV cache only "
             "for BF16 NoPE models (qk_rope_head_dim == 0, kv_lora_rank a multiple "
             "of 128) with both --dsa-prefill-backend and --dsa-decode-backend set "
-            "to tilelang and --dcp-size 1. Otherwise use --kv-cache-dtype "
-            "bfloat16, or pick an fp8-capable DSA backend (flashmla_kv on Hopper, "
-            "trtllm on Blackwell)."
+            "to tilelang, --dcp-size 1 and HiSparse off. Otherwise use "
+            "--kv-cache-dtype bfloat16, or pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
 
