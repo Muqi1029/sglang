@@ -106,9 +106,15 @@ def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
+            # Marlin and Humming apply routed_scaling_factor inside their
+            # runners (marlin_moe / moe_fused_mul_sum), so top-k must not
+            # pre-fold it or routed experts get scaled twice.
             and not getattr(
                 quant_method, "_moe_runner_backend", get_moe_runner_backend()
             ).is_marlin()
+            and not getattr(
+                quant_method, "_moe_runner_backend", get_moe_runner_backend()
+            ).is_humming()
         )
         or (
             isinstance(quant_method, Fp8MoEMethod)
