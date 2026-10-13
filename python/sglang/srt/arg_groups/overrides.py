@@ -565,6 +565,7 @@ def _check_dsa_backend_constraints(
             "to tilelang, --dcp-size 1 and HiSparse off. Otherwise use "
             "--kv-cache-dtype bfloat16, or pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":
