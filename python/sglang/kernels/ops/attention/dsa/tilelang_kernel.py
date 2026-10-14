@@ -1602,7 +1602,37 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    if _is_hip or is_fp8_kv:
+    # Two fp8 row layouts arrive here: the raw one (d_v + tail_dim values, no
+    # scale bytes) and the group-scaled NoPE one the CUDA pool stores (d_v
+    # values plus one FP32 scale per 128). ``is_fp8_kv`` cannot tell them apart,
+    # so the dispatch below keys on the row width; without that the group arm is
+    # unreachable and a group-scaled row is handed to the raw kernel, which
+    # rejects it.
+    num_scales = d_v // 128
+    is_group_scaled = (
+        is_fp8_kv
+        and d_v % 128 == 0
+        and tail_dim == 0
+        and kv.shape[-1] == d_v + num_scales * 4
+    )
+    reject_raw_nope = (
+        is_fp8_kv
+        and not _is_hip
+        and tail_dim == 0
+        and d_v == 512
+        and not is_group_scaled
+    )
+    if reject_raw_nope:
+        # d_v == 512 with no RoPE tail is the geometry whose CUDA pool writes
+        # group-scaled rows; a raw row here came from the ROCm/raw writer and
+        # is not a layout this kernel serves.
+        raise ValueError(
+            "CUDA TileLang FP8 KV expects a group-scaled NoPE row "
+            f"({d_v} FP8 values + {num_scales} FP32 scales = "
+            f"{d_v + num_scales * 4} bytes); got a raw {kv.shape[-1]}-byte row "
+            f"with d_v={d_v}."
+        )
+    if _is_hip or (is_fp8_kv and not is_group_scaled):
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)

@@ -529,14 +529,16 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
-    nope_group_scaled: bool = False,
+    nope_group_scaled: Optional[bool] = None,
     dcp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints.
 
     ``nope_group_scaled`` marks a BF16 model whose MLA cache has no RoPE part
     and a 128-aligned latent, i.e. one whose fp8 rows are the group-scaled
-    NoPE layout the CUDA TileLang kernel consumes.
+    NoPE layout the CUDA TileLang kernel consumes. ``None`` means the caller has
+    no model geometry (the legacy entry point) and only the platform rules below
+    apply.
     """
     chosen = {prefill_backend, decode_backend}
 
@@ -549,7 +551,15 @@ def _check_dsa_backend_constraints(
         )
 
     cuda_fp8_tilelang = {"tilelang"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_tilelang:
+    # ``nope_group_scaled is None`` means the caller carries no model geometry
+    # (the legacy shim), so the pre-existing platform rules below apply instead
+    # of this CUDA-only group-scaled gate.
+    if (
+        not hip
+        and kv_cache_dtype == "fp8_e4m3"
+        and cuda_fp8_tilelang
+        and nope_group_scaled is not None
+    ):
         # Both phases must read the same group-scaled NoPE rows; any other
         # prefill/decode consumer expects a RoPE tail or a different layout.
         if (

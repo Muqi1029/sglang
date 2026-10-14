@@ -78,11 +78,16 @@ def _kda_track_ssm_kernel(
     dst = tl.load(track_dst + r).to(tl.int64)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
+    # Both branches are normalized to fp32: ``ssm_pool`` follows
+    # --mamba-ssm-dtype (fp32 / bf16 / fp16) while ``h_track`` is always fp32,
+    # so without the cast the two branches disagree on type and Triton refuses
+    # to compile the select. The store below rounds back to the pool dtype.
     if mode == 1:
         src = tl.load(cache_indices + r).to(tl.int64)
-        val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
+        val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask).to(tl.float32)
     else:
         val = tl.load(h_track + r.to(tl.int64) * stride_h_row + offs, mask=mask)
+        val = val.to(tl.float32)
     tl.store(
         ssm_pool + dst * stride_ssm_slot + offs,
         val.to(ssm_pool.dtype.element_ty),

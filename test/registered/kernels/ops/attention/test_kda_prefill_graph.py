@@ -14,6 +14,12 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.fla.kda_prefill_graph_track import (
+    TRACK_CHUNK_STATE,
+    TRACK_FINAL_STATE,
+    TRACK_NONE,
+    kda_track_ssm_state,
+)
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
@@ -267,6 +273,46 @@ class TestKDAPrefillGraph(CustomTestCase):
         lens = [1] * (MAX_SEQS - 1) + [BUCKET - MAX_SEQS + 1]
         chunks = sum((n + CHUNK - 1) // CHUNK for n in lens)
         self.assertLessEqual(chunks, meta.max_chunks)
+
+    def test_track_ssm_state_non_fp32_pool(self):
+        """The track kernel reads the pool (--mamba-ssm-dtype) in mode 1 and the
+        always-fp32 ``h_track`` in mode 2; a non-fp32 pool used to make the two
+        branches disagree on type and Triton refused to compile the select."""
+        rows, numel = 4, 1024
+        mode = torch.tensor(
+            [TRACK_FINAL_STATE, TRACK_CHUNK_STATE, TRACK_NONE, TRACK_FINAL_STATE],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        dst = torch.tensor([4, 5, 6, 7], dtype=torch.int64, device="cuda")
+        cache_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device="cuda")
+        g = torch.Generator(device="cuda").manual_seed(23)
+
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            with self.subTest(ssm_dtype=dtype):
+                pool = torch.randn(
+                    NUM_SLOTS, numel, generator=g, device="cuda", dtype=dtype
+                )
+                h_track = torch.randn(
+                    rows, numel, generator=g, device="cuda", dtype=torch.float32
+                )
+                pool_in = pool.clone()
+
+                expect = pool_in.clone()
+                for r in range(rows):
+                    if mode[r] == TRACK_FINAL_STATE:
+                        expect[dst[r]] = pool_in[cache_indices[r]]
+                    elif mode[r] == TRACK_CHUNK_STATE:
+                        expect[dst[r]] = h_track[r].to(dtype)
+
+                kda_track_ssm_state(
+                    ssm_pool=pool,
+                    h_track=h_track,
+                    track_mode=mode,
+                    track_dst=dst,
+                    cache_indices=cache_indices,
+                )
+                self.assertTrue(torch.equal(pool, expect))
 
 
 if __name__ == "__main__":

@@ -3107,11 +3107,13 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
-    # validation requires both consumers to use the same TileLang layout.
+    # CUDA TileLang consumes group-scaled NoPE rows: kv_lora_rank FP8 values
+    # plus one FP32 scale per quant block. A RoPE tail keeps the raw layout
+    # below, which is the only shape that raw path serves.
     if (
         get_exec().kernel.dsa_prefill_backend == "tilelang"
         and get_exec().kernel.dsa_decode_backend == "tilelang"
+        and qk_rope_head_dim != 0
     ):
         return kv_cache_dim
 
