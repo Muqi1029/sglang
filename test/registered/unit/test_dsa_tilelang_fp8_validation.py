@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.model_override_base import ResolvedView
 from sglang.srt.arg_groups.overrides import (
-    ResolvedView,
     _check_dsa_backend_constraints,
     _check_tilelang_dsa_fp8_kv,
     _dsa_split_backend_resolution,
