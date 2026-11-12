@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.model_override_base import ResolvedView
 from sglang.srt.arg_groups.overrides import (
-    ResolvedView,
     _check_dsa_backend_constraints,
     _check_tilelang_dsa_fp8_kv,
     _dsa_split_backend_resolution,
@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDsaTilelangFp8Validation(CustomTestCase):
