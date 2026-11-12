@@ -169,6 +169,9 @@ class SchedulerInternalStateController:
 
     def _update_handlers(self) -> Dict[str, _UpdateHandler]:
         return {
+            "debug_evict_l1": _UpdateHandler(
+                self._validate_debug_evict_l1, self._apply_debug_evict_l1
+            ),
             "pp_max_micro_batch_size": _UpdateHandler(
                 self._validate_pp_micro_batch_size, _override
             ),
@@ -185,6 +188,44 @@ class SchedulerInternalStateController:
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
         }
+
+    def _validate_debug_evict_l1(self, key: str, value: Any) -> None:
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        scheduler = self.scheduler
+        cache = scheduler.tree_cache
+        if value != 1:
+            raise UpdateRejected("debug_evict_l1 requires 1.")
+        if not scheduler.is_fully_idle():
+            raise UpdateRejected("debug_evict_l1 requires an idle scheduler.")
+        if (
+            not scheduler.enable_hierarchical_cache
+            or not isinstance(cache, UnifiedRadixCache)
+            or cache.host_memory_mode != "cache"
+            or cache.cache_controller is None
+            or cache.cache_controller.write_policy
+            not in ("write_through", "write_back")
+        ):
+            raise UpdateRejected(
+                "debug_evict_l1 requires write-through or write-back HiCache in cache mode."
+            )
+
+    def _apply_debug_evict_l1(self, key: str, value: Any) -> None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        cache = self.scheduler.tree_cache
+        # Finish publishing CPU copies before freeing their GPU counterparts.
+        cache.writing_check(write_back=True)
+        before = cache.full_evictable_size()
+        result = cache.evict(EvictParams(num_tokens=before))
+        cache.writing_check(write_back=True)
+        logger.info(
+            "debug_evict_l1: before=%d evicted=%d remaining=%d protected=%d; CPU cache retained",
+            before,
+            result.num_tokens_evicted,
+            cache.full_evictable_size(),
+            cache.full_protected_size(),
+        )
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
         upper = self.scheduler.max_running_requests // get_parallel().pp_size

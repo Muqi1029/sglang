@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from functools import cache
 from typing import Any, Callable, NamedTuple, Optional
@@ -85,6 +86,11 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
+        self.debug_verifier = None
+        if directory := os.environ.get("SGLANG_DEBUG_L2_VERIFY_DIR"):
+            from sglang.srt.mem_cache.l2_debug_verify import L2ByteVerifier
+
+            self.debug_verifier = L2ByteVerifier(directory)
         if (
             io_backend == "direct"
             and device_module is torch.cuda
@@ -207,6 +213,8 @@ class L2TransferEngine:
             transfers, self.device_to_host_stream, "device_to_host"
         ) as (transfers, completion):
             for transfer in transfers:
+                if self.debug_verifier is not None:
+                    self.debug_verifier.snapshot(transfer)
                 transfer.host_pool.backup_from_device_all_layer_physical(
                     transfer.device_pool,
                     transfer.host_indices,
@@ -249,6 +257,8 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
+                    if self.debug_verifier is not None:
+                        self.debug_verifier.poison(transfer, local_layer_id)
                     transfer.host_pool.load_to_device_per_layer_physical(
                         transfer.device_pool,
                         transfer.host_indices,
@@ -257,6 +267,8 @@ class L2TransferEngine:
                         self.io_backend,
                         is_draft=transfer.is_draft,
                     )
+                    if self.debug_verifier is not None:
+                        self.debug_verifier.compare(transfer, local_layer_id)
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
