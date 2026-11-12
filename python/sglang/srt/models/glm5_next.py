@@ -28,6 +28,10 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.cp_decode_attn_tp import (
+    can_defer_cp_decode_attn_tp,
+    get_cp_decode_attn_tp_ctx,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -39,6 +43,7 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -910,10 +915,20 @@ class Glm5NextDecoderLayer(nn.Module):
             declare_attn(
                 read=residual.attn_readout,
                 update=residual.attn_update,
-                tp_group=SumGroup.TP
-                if config.is_kda_layer(layer_id)
-                and linear_attn_parallel_group() == "tp"
-                else SumGroup.ATTN_TP,
+                tp_group=(
+                    SumGroup.TP
+                    if config.is_kda_layer(layer_id)
+                    and linear_attn_parallel_group() == "tp"
+                    else SumGroup.ATTN_TP
+                ),
+                ordinary_tp_group=(
+                    SumGroup.TP
+                    if not config.is_kda_layer(layer_id)
+                    and is_deepseek_dsa(config)
+                    and config.q_lora_rank is not None
+                    and can_defer_cp_decode_attn_tp()
+                    else None
+                ),
             ),
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
@@ -1037,14 +1052,27 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, forward_batch, capture=capture_output
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
-            prev_topk_indices=prev_topk_indices,
-        )
+        # KDA already partitions heads over TP. Only the replicated DSA
+        # projections switch from CP prefill to TP on ordinary rows, including
+        # DFLASH target verification and short extends that do not use CP.
+        with (
+            nullcontext()
+            if self.is_linear_attn
+            else self.self_attn.maybe_use_decode_attn_tp(forward_batch)
+        ):
+            if getattr(self.self_attn, "defer_cp_decode_attn_tp", False):
+                assert get_cp_decode_attn_tp_ctx().use_decode_attn_tp == (
+                    self.attn_boundary.plan.variant_for(forward_batch)
+                    is BatchVariant.ORDINARY
+                ), "CP decode weight dispatch disagrees with the boundary sum"
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
+                prev_topk_indices=prev_topk_indices,
+            )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
