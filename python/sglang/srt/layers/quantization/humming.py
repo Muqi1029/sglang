@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import logging
 import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, List
@@ -49,6 +50,8 @@ BaseInputSchema = None
 BaseWeightSchema = None
 HummingInputSchema = None
 HummingWeightSchema = None
+
+logger = logging.getLogger(__name__)
 
 
 def _lazy_import_humming():
@@ -162,7 +165,95 @@ def _convert_humming_tensors(
                 )
         input_schema = force_input_schema
 
+    weight_schema, input_schema, weight_tensors, input_tensors = (
+        _adapt_nvfp4_without_block_scaled_mma(
+            weight_schema, input_schema, weight_tensors, input_tensors, param_dtype
+        )
+    )
     return weight_schema, input_schema, weight_tensors | input_tensors
+
+
+def _adapt_nvfp4_without_block_scaled_mma(
+    weight_schema,
+    input_schema,
+    weight_tensors,
+    input_tensors,
+    param_dtype,
+):
+    """Adapt NVFP4 and FP8 schemas on SM80-SM90 GPUs (including A30 and L40)."""
+    from sglang.srt.utils.device import get_device_capability, is_cuda
+
+    _lazy_import_humming()
+    weight = weight_tensors.get("weight")
+    if not (is_cuda() and weight is not None and weight.is_cuda):
+        return weight_schema, input_schema, weight_tensors, input_tensors
+
+    capability = get_device_capability()
+    is_nvfp4_group16 = (
+        getattr(weight_schema, "b_dtype", None) == DataType.from_str("float4e2m1")
+        and getattr(weight_schema, "weight_scale_group_size", None) == 16
+    )
+    if not is_nvfp4_group16:
+        a_dtype = getattr(input_schema, "a_dtype", None)
+        is_fp8_input = a_dtype in (
+            DataType.from_str("float8e4m3"),
+            DataType.from_str("float8e5m2"),
+        )
+        if is_fp8_input and (8, 0) <= capability < (8, 9):
+            logger.warning_once(
+                "Ampere GPUs (SM80-SM87) lack FP8 Tensor Cores; Humming runs "
+                "FP8-calibrated layers with BF16/FP16 activations (W8A16/W4A16)."
+            )
+            return weight_schema, HummingInputSchema(), weight_tensors, {}
+        return weight_schema, input_schema, weight_tensors, input_tensors
+
+    if capability >= (10, 0) or capability < (8, 0):
+        return weight_schema, input_schema, weight_tensors, input_tensors
+
+    if capability >= (8, 9):
+        target_weight = HummingWeightSchema(
+            b_dtype="float4e2m1",
+            weight_scale_group_size=32,
+            weight_scale_type="group",
+            weight_scale_2_type="none",
+        )
+        bias = weight_tensors.get("bias")
+        weight_tensors = weight_schema.requant_tensors(
+            tensors=weight_tensors,
+            target_weight_schema=target_weight,
+            param_dtype=param_dtype,
+        )
+        if bias is not None:
+            weight_tensors["bias"] = bias
+        logger.warning_once(
+            "Humming NVFP4 on SM89+ requantizes group-16 checkpoint weights to "
+            "group-32 and uses dynamic FP8 activations. This introduces "
+            "additional quantization error."
+        )
+        return (
+            target_weight,
+            HummingInputSchema(a_dtype="float8e4m3"),
+            weight_tensors,
+            {},
+        )
+
+    # SM80-SM87 (Ampere): fold secondary scales into 16-bit group scales for W4A16.
+    weight_tensors = dict(weight_tensors)
+    scale_2 = weight_tensors.pop("weight_scale_2", None)
+    weight_scale = weight_tensors["weight_scale"].float()
+    if scale_2 is not None:
+        scale_2 = scale_2.float()
+        while scale_2.ndim < weight_scale.ndim:
+            scale_2 = scale_2.unsqueeze(-1)
+        weight_scale = weight_scale * scale_2
+    weight_tensors["weight_scale"] = weight_scale.to(param_dtype)
+    target_weight = HummingWeightSchema(
+        b_dtype="float4e2m1",
+        weight_scale_group_size=16,
+        weight_scale_type="group",
+        weight_scale_2_type="none",
+    )
+    return target_weight, HummingInputSchema(), weight_tensors, {}
 
 
 def _replace_humming_parameters(layer, tensors, sublayer_name=""):
@@ -379,7 +470,7 @@ class _W4AFp8CheckpointWeightSchema(_CheckpointWeightSchema):
 
 
 class _StackedBlockFp8CheckpointWeightSchema(_CheckpointWeightSchema):
-    def __init__(self, schema):
+    def __init__(self, schema, scale_name: str | None = None):
         self.schema = schema
         self.quant_method = schema.quant_method
         weight_block_size = tuple(schema.weight_block_size)
@@ -392,7 +483,20 @@ class _StackedBlockFp8CheckpointWeightSchema(_CheckpointWeightSchema):
                 f"got {schema.weight_block_size!r}."
             )
         self.weight_block_size = weight_block_size
-        self.weight_scale_key = schema.weight_scale_key
+        self.weight_scale_key = scale_name or schema.weight_scale_key
+
+    def process_loaded_weight(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        if (
+            name == self.weight_scale_key
+            and tensor.ndim == 4
+            and tensor.shape[1] == 1
+            and tensor.shape[3] == 1
+        ):
+            tensor = tensor[:, 0, :, 0].contiguous()
+        canonical = (
+            self.schema.weight_scale_key if name == self.weight_scale_key else name
+        )
+        return self.schema.process_loaded_weight(tensor, canonical)
 
     def get_tensors_attrs(
         self,
@@ -411,6 +515,10 @@ class _StackedBlockFp8CheckpointWeightSchema(_CheckpointWeightSchema):
             has_bias=has_bias,
             stack_size=stack_size,
         )
+        if self.weight_scale_key != self.schema.weight_scale_key:
+            tensors_attrs[self.weight_scale_key] = tensors_attrs.pop(
+                self.schema.weight_scale_key
+            )
         block_n, block_k = self.weight_block_size
         scale_shape = (math.ceil(shape_n / block_n), math.ceil(shape_k / block_k))
         if num_experts:
@@ -447,8 +555,16 @@ class _StackedBlockFp8CheckpointWeightSchema(_CheckpointWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ):
+        schema_tensors = tensors
+        if self.weight_scale_key != self.schema.weight_scale_key:
+            schema_tensors = {
+                k: v for k, v in tensors.items() if k != self.weight_scale_key
+            }
+            schema_tensors[self.schema.weight_scale_key] = tensors[
+                self.weight_scale_key
+            ]
         schema, output_tensors = self.schema.convert_humming(
-            tensors=tensors,
+            tensors=schema_tensors,
             shape_n_stacks=shape_n_stacks,
             shape_k_stacks=shape_k_stacks,
             param_dtype=param_dtype,
@@ -500,6 +616,102 @@ def _validate_block_fp8_partition_shape(
     )
 
 
+_MIXED_FUSED_PROJECTIONS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
+
+
+def _modelopt_mixed_layer_config(
+    config: dict[str, Any], prefix: str
+) -> dict[str, Any] | None:
+    """Resolve per-layer Humming checkpoint config for ModelOpt MIXED_PRECISION."""
+    quantized_layers = config.get("quantized_layers")
+    if (
+        config.get("quant_method") not in ("modelopt", "modelopt_mixed")
+        or str(config.get("quant_algo") or "").upper() != "MIXED_PRECISION"
+        or not isinstance(quantized_layers, dict)
+    ):
+        return config
+
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    candidates = ModelOptMixedPrecisionConfig._quantized_layer_prefix_candidates(prefix)
+    info = next(
+        (
+            quantized_layers[c]
+            for c in candidates
+            if isinstance(quantized_layers.get(c), dict)
+        ),
+        None,
+    )
+    if info is None and "." in prefix:
+        base, proj_name = prefix.rsplit(".", 1)
+        mapping = config.get("packed_modules_mapping") or {}
+        shards = mapping.get(proj_name) or _MIXED_FUSED_PROJECTIONS.get(proj_name)
+        if shards:
+            matched_infos = [
+                shard_info
+                for base_c in ModelOptMixedPrecisionConfig._quantized_layer_prefix_candidates(
+                    base
+                )
+                for shard_name in shards
+                if isinstance(
+                    shard_info := quantized_layers.get(f"{base_c}.{shard_name}"), dict
+                )
+            ]
+            algos = {
+                str(item.get("quant_algo") or "").upper() for item in matched_infos
+            }
+            if len(algos) > 1:
+                raise ValueError(
+                    f"Mixed quant_algo within fused layer {prefix}: {algos}. "
+                    "All shards must use the same quantization."
+                )
+            if matched_infos:
+                info = dict(matched_infos[-1])
+    if info is None:
+        info = next(
+            (
+                v
+                for c in candidates
+                for k, v in quantized_layers.items()
+                if k.startswith(f"{c}.") and isinstance(v, dict)
+            ),
+            None,
+        )
+    if info is None:
+        return None
+
+    algo = str(info.get("quant_algo") or "").upper()
+    if algo == "FP8":
+        return {"quant_method": "fp8", "activation_scheme": "static"}
+    if algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
+        group_size = int(info.get("group_size") or 128)
+        return {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [group_size, group_size],
+            "checkpoint_scale_name": "weight_scale",
+        }
+    if algo in ("NVFP4", "W4A16_NVFP4"):
+        layer_config: dict[str, Any] = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "is_w4a16": algo == "W4A16_NVFP4",
+        }
+        if info.get("group_size") is not None:
+            layer_config["group_size"] = info["group_size"]
+        return layer_config
+    if algo == "MXFP8":
+        return {"quant_method": "modelopt", "quant_algo": "MXFP8"}
+    raise ValueError(
+        f"Unsupported ModelOpt mixed quant_algo {algo!r} for layer {prefix}."
+    )
+
+
 def _build_checkpoint_weight_schema(layer_config: dict[str, Any]):
     quant_method = layer_config.get("quant_method")
     if quant_method is None:
@@ -511,7 +723,9 @@ def _build_checkpoint_weight_schema(layer_config: dict[str, Any]):
 
     schema = BaseWeightSchema.from_config(layer_config)
     if quant_method == "fp8" and getattr(schema, "weight_block_size", None):
-        return _StackedBlockFp8CheckpointWeightSchema(schema)
+        return _StackedBlockFp8CheckpointWeightSchema(
+            schema, scale_name=layer_config.get("checkpoint_scale_name")
+        )
     return schema
 
 
@@ -594,7 +808,7 @@ class HummingConfig(QuantizationConfig):
             elif entry in prefix:
                 return True
 
-        if "lm_head" in prefix:
+        if "lm_head" in prefix and not isinstance(config.get("quantized_layers"), dict):
             return True
 
         for regex in config.get("dynamic", {}):
@@ -607,6 +821,9 @@ class HummingConfig(QuantizationConfig):
 
     def get_layer_weight_schema(self, config: dict[str, Any], prefix: str):
         if self.is_layer_skipped(config, prefix):
+            return None
+        config = _modelopt_mixed_layer_config(config, prefix)
+        if config is None:
             return None
 
         if "config_groups" in config:
@@ -631,6 +848,9 @@ class HummingConfig(QuantizationConfig):
 
     def get_layer_input_schema(self, config: dict[str, Any], prefix: str):
         if self.is_layer_skipped(config, prefix):
+            return None
+        config = _modelopt_mixed_layer_config(config, prefix)
+        if config is None or config.get("is_w4a16"):
             return None
         if "config_groups" in config:
             group_config = compressed_tensors_get_config(config, "input_activations")
@@ -746,10 +966,11 @@ class HummingConfig(QuantizationConfig):
     ) -> "QuantizeMethodBase | None":
         layer_type = "other"
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, FusedMoE):
             layer_type = "moe"
-        elif isinstance(layer, LinearBase):
+        elif isinstance(layer, (LinearBase, ParallelLMHead)):
             layer_type = "linear"
 
         if (
@@ -769,7 +990,8 @@ class HummingConfig(QuantizationConfig):
                 return UnquantizedFusedMoEMethod()
             elif isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
-        elif isinstance(layer, LinearBase):
+            return None
+        elif isinstance(layer, (LinearBase, ParallelLMHead)):
             return HummingLinearMethod(quant_config)
         elif isinstance(layer, FusedMoE):
             return HummingMoEMethod(quant_config)
@@ -883,6 +1105,27 @@ class HummingLinearMethod(LinearMethodBase):
                 tensor=loaded_weight,
                 name=name,
             )
+            block_size = getattr(layer, "weight_block_size", None)
+            if (
+                shard_id is not None
+                and block_size
+                and name in ("weight_scale", "weight_scale_inv")
+                and any(s % block_size[0] != 0 for s in layer.output_partition_sizes)
+            ):
+                block_n = block_size[0]
+                shard_index = (
+                    shard_id
+                    if isinstance(shard_id, int)
+                    else {"q": 0, "k": 1, "v": 2}[shard_id]
+                )
+                offset = sum(
+                    math.ceil(size / block_n)
+                    for size in layer.output_partition_sizes[:shard_index]
+                )
+                rows = math.ceil(layer.output_partition_sizes[shard_index] / block_n)
+                if param.data[offset : offset + rows].shape == loaded_weight.shape:
+                    param.data[offset : offset + rows].copy_(loaded_weight)
+                    return None
             if shard_id is not None:
                 return weight_loader(param, loaded_weight, shard_id)
             return weight_loader(param, loaded_weight)
@@ -964,7 +1207,7 @@ class HummingLinearMethod(LinearMethodBase):
             param = prepare_param(tensor, name, extra_attrs)
             setattr(layer, name, param)
 
-        locks = torch.zeros(1024, dtype=torch.int32)
+        locks = torch.zeros(2048, dtype=torch.int32)
         layer.register_buffer("locks", locks)
 
         if not hasattr(layer, "weight"):
@@ -998,7 +1241,9 @@ class HummingLinearMethod(LinearMethodBase):
             input_schema=self.input_schema,
             pad_n_to_multiple=256,
             pad_k_to_multiple=128,
-            has_bias=layer.with_bias,
+            has_bias=getattr(
+                layer, "with_bias", getattr(layer, "bias", None) is not None
+            ),
             torch_dtype=layer.param_dtype,
             tensors=tensors,
         )
@@ -1169,7 +1414,7 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 param = prepare_moe_param(tensor, name, extra_attrs)
                 setattr(layer, f"{sublayer_name}_{name}", param)
 
-        locks = torch.zeros(1024, dtype=torch.int32)
+        locks = torch.zeros(2048, dtype=torch.int32)
         layer.register_buffer("locks", locks)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

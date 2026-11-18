@@ -202,6 +202,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_trtllm",
     "marlin",
+    "humming",
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = [

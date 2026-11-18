@@ -25,8 +25,12 @@ import torch
 # Import modelopt_quant before flashinfer_trtllm (see
 # test_modelopt_nvfp4_moe_scales.py for the circular-import reason).
 # isort: off
-from sglang.srt.layers.quantization import modelopt_quant
+from sglang.srt.layers.quantization import fp4_utils, modelopt_quant
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    _fuses_routed_scaling_factor_in_topk,
+)
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp4MoeQuantInfo,
 )
@@ -35,7 +39,12 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
+from sglang.srt.runtime_context import get_flags
 from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 8
@@ -133,6 +142,79 @@ def _method_set_up_for(backend: MoeRunnerBackend) -> ModelOptNvFp4FusedMoEMethod
 
 
 class TestNvFp4MoeDispatch(CustomTestCase):
+    def test_fp4_humming_selects_humming_moe_runner_when_moe_backend_is_auto(self):
+        for capability in ((8, 0), (8, 6), (8, 9)):
+            with self.subTest(capability=capability):
+                config = MoeRunnerConfig(
+                    num_experts=NUM_EXPERTS,
+                    num_local_experts=NUM_EXPERTS,
+                    hidden_size=HIDDEN,
+                    intermediate_size_per_partition=INTERMEDIATE,
+                    activation="silu",
+                    is_gated=True,
+                )
+                runner = _Runner()
+                with (
+                    mock.patch.object(
+                        fp4_utils,
+                        "FP4_GEMM_RUNNER_BACKEND",
+                        Fp4GemmRunnerBackend.HUMMING,
+                    ),
+                    get_flags().moe.override(
+                        runner_backend=MoeRunnerBackend.AUTO,
+                        a2a_backend=MoeA2ABackend.NONE,
+                    ),
+                    mock.patch.object(
+                        modelopt_quant,
+                        "get_platform",
+                        return_value=SimpleNamespace(is_blackwell=False),
+                    ),
+                    mock.patch.object(modelopt_quant, "is_cuda", return_value=True),
+                    mock.patch.object(
+                        modelopt_quant, "get_device_capability", return_value=capability
+                    ),
+                    mock.patch.object(modelopt_quant, "MoeRunner", return_value=runner),
+                ):
+                    method = ModelOptNvFp4FusedMoEMethod(
+                        SimpleNamespace(use_per_token_activation=False)
+                    )
+                    method.create_moe_runner(SimpleNamespace(), config)
+                    with get_flags().moe.override(
+                        runner_backend=MoeRunnerBackend.MARLIN
+                    ):
+                        explicit = ModelOptNvFp4FusedMoEMethod(
+                            SimpleNamespace(use_per_token_activation=False)
+                        )
+                        explicit.create_moe_runner(SimpleNamespace(), config)
+                        self.assertIs(
+                            explicit.get_moe_runner_backend(None),
+                            MoeRunnerBackend.MARLIN,
+                        )
+
+                self.assertIs(method.runner, runner)
+                self.assertIs(
+                    method.get_moe_runner_backend(None), MoeRunnerBackend.HUMMING
+                )
+                # HummingRunnerCore applies routed_scaling_factor inside the runner,
+                # so top-k must NOT pre-multiply it.
+                self.assertFalse(
+                    _fuses_routed_scaling_factor_in_topk(
+                        method, MoeRunnerBackend.HUMMING
+                    )
+                )
+                layer = _trtllm_prepared_layer()
+                dispatch_output = object()
+                # The global backend can differ during speculative decoding. apply()
+                # must keep using the layer's cached Humming runner and payload.
+                with get_flags().moe.override(runner_backend=MoeRunnerBackend.MARLIN):
+                    self.assertEqual(
+                        method.apply(layer, dispatch_output), "combine-input"
+                    )
+                ((seen_dispatch, quant_info),) = runner.calls
+                self.assertIs(seen_dispatch, dispatch_output)
+                self.assertEqual(type(quant_info).__name__, "HummingMoeQuantInfo")
+                self.assertIs(quant_info.layer, layer)
+
     def test_routed_trtllm_takes_the_trtllm_path(self):
         for backend in (
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,

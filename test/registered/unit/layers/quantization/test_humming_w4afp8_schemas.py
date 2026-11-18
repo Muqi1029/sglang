@@ -440,6 +440,171 @@ class TestHummingCheckpointConfig(CustomTestCase):
         self.assertEqual(layer_config.weight_schema.quant_algo, "NVFP4")
         self.assertEqual(layer_config.input_schema.get_activation_bits(), 4)
 
+    def test_modelopt_mixed_precision_selects_per_layer_schema(self):
+        config = HummingConfig(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "ignore": ["lm_head", "model.embed_tokens"],
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"num_bits": 8, "type": "float"},
+                        "targets": ["model.layers.0.self_attn.q_proj"],
+                    }
+                },
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+                    "model.layers.0.self_attn.k_proj": {"quant_algo": "FP8"},
+                    "model.layers.0.self_attn.v_proj": {"quant_algo": "FP8"},
+                    "model.layers.0.mlp.gate_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.layers.0.mlp.up_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.layers.0.mlp.down_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                },
+            }
+        )
+        attn = config.get_quant_config_for_layer(
+            "model.layers.0.self_attn.qkv_proj", "linear"
+        )
+        self.assertEqual(attn.weight_schema.quant_method, "fp8")
+        self.assertEqual(attn.input_schema.activation_scheme, "static")
+        mlp = config.get_quant_config_for_layer(
+            "model.layers.0.mlp.gate_up_proj", "linear"
+        )
+        self.assertEqual(mlp.weight_schema.quant_algo, "NVFP4")
+        self.assertEqual(mlp.input_schema.get_activation_bits(), 4)
+        down = config.get_quant_config_for_layer(
+            "model.layers.0.mlp.down_proj", "linear"
+        )
+        self.assertEqual(down.weight_schema.quant_algo, "NVFP4")
+        self.assertEqual(down.input_schema.get_activation_bits(), 16)
+
+        rewritten = HummingConfig(
+            {**config.full_config, "quant_method": "modelopt_mixed"}
+        )
+        rewritten_mlp = rewritten.get_quant_config_for_layer(
+            "model.layers.0.mlp.gate_up_proj", "linear"
+        )
+        self.assertEqual(rewritten_mlp.weight_schema.quant_algo, "NVFP4")
+
+        block = HummingConfig(
+            {
+                "quant_method": "modelopt_mixed",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {
+                        "quant_algo": "FP8_PB_WO",
+                        "group_size": 128,
+                    },
+                    "model.layers.0.self_attn.k_proj": {
+                        "quant_algo": "FP8_PB_WO",
+                        "group_size": 128,
+                    },
+                    "model.layers.0.self_attn.v_proj": {
+                        "quant_algo": "FP8_PB_WO",
+                        "group_size": 128,
+                    },
+                },
+            }
+        ).get_quant_config_for_layer("model.layers.0.self_attn.qkv_proj", "linear")
+        self.assertEqual(block.weight_schema.weight_block_size, (128, 128))
+        self.assertEqual(block.weight_schema.weight_scale_key, "weight_scale")
+        self.assertEqual(block.input_schema.activation_scheme, "dynamic")
+        squeezed = block.weight_schema.process_loaded_weight(
+            torch.ones(2, 1, 4, 1), "weight_scale"
+        )
+        self.assertEqual(squeezed.shape, (2, 4))
+
+        self.assertIsNone(
+            config.get_quant_config_for_layer("model.embed_tokens", "linear")
+        )
+        self.assertIsNone(config.get_quant_config_for_layer("lm_head", "linear"))
+        mixed_lm_head = HummingConfig(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+                },
+            }
+        ).get_quant_config_for_layer("language_model.lm_head", "linear")
+        self.assertEqual(mixed_lm_head.weight_schema.quant_algo, "NVFP4")
+        self.assertEqual(mixed_lm_head.input_schema.get_activation_bits(), 16)
+        with self.assertRaisesRegex(ValueError, "same quantization"):
+            broken = HummingConfig(
+                {
+                    "quant_method": "modelopt",
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.gate_proj": {"quant_algo": "NVFP4"},
+                        "model.layers.0.mlp.up_proj": {"quant_algo": "FP8"},
+                    },
+                }
+            )
+            broken.get_quant_config_for_layer(
+                "model.layers.0.mlp.gate_up_proj", "linear"
+            )
+
+    def test_nvfp4_adaptation_preserves_non_nvfp4_four_bit_schemas(self):
+        from humming.schema import HummingInputSchema, HummingWeightSchema
+
+        from sglang.srt.layers.quantization.humming import (
+            _adapt_nvfp4_without_block_scaled_mma,
+        )
+
+        # W4AFP8 uint4 group-128 must NOT be requantized on SM89/SM90.
+        w4afp8_schema = HummingWeightSchema(
+            b_dtype="uint4", weight_scale_group_size=128
+        )
+        fp8_in = HummingInputSchema(
+            a_dtype="float8e4m3", input_quant_mode="static_tensor"
+        )
+        fake_weight = SimpleNamespace(is_cuda=True)
+        static_in = {"input_scale": torch.tensor([0.5])}
+        with (
+            patch("sglang.srt.utils.device.is_cuda", return_value=True),
+            patch("sglang.srt.utils.device.get_device_capability", return_value=(8, 9)),
+        ):
+            out_w, out_in, _, out_in_tensors = _adapt_nvfp4_without_block_scaled_mma(
+                w4afp8_schema,
+                fp8_in,
+                {"weight": fake_weight},
+                static_in,
+                torch.bfloat16,
+            )
+        self.assertIs(out_w, w4afp8_schema)
+        self.assertIs(out_in, fp8_in)
+        self.assertEqual(out_in_tensors, static_in)
+
+        # On A30 (SM80), FP8 input schemas fall back to 16-bit activations (W8A16).
+        fp8_w_schema = HummingWeightSchema(
+            b_dtype="float8e4m3", weight_scale_type="tensor"
+        )
+        with (
+            patch("sglang.srt.utils.device.is_cuda", return_value=True),
+            patch("sglang.srt.utils.device.get_device_capability", return_value=(8, 0)),
+        ):
+            out_w80, out_in80, _, out_in80_tensors = (
+                _adapt_nvfp4_without_block_scaled_mma(
+                    fp8_w_schema,
+                    fp8_in,
+                    {"weight": fake_weight},
+                    static_in,
+                    torch.bfloat16,
+                )
+            )
+        self.assertIs(out_w80, fp8_w_schema)
+        self.assertEqual(out_in80.get_activation_bits(), 16)
+        self.assertEqual(out_in80_tensors, {})
+
 
 if __name__ == "__main__":
     unittest.main()

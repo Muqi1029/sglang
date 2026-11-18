@@ -196,6 +196,22 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
         if self.has_input_global_scale:
             del layer.input_global_scale
 
+        if get_fp4_gemm_runner_backend().is_humming():
+            from sglang.srt.layers.quantization.nvfp4_humming import (
+                prepare_nvfp4_layer_for_humming,
+            )
+
+            copy_or_rebind_param(layer, "weight", layer.weight_packed.data)
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_2",
+                (1 / layer.weight_global_scale.data.to(torch.float32)),
+            )
+            del layer.weight_packed, layer.weight_global_scale
+            prepare_nvfp4_layer_for_humming(layer, self.group_size)
+            layer.use_humming = True
+            return
+
         # Both kernels take one global scale per layer. With fused projections
         # (q/k/v, gate/up) that only matches the checkpoint if every projection
         # shares it: substituting one scale while keeping the other projections'
@@ -251,6 +267,13 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "use_humming", False):
+            from sglang.srt.layers.quantization.nvfp4_humming import (
+                apply_nvfp4_humming_linear,
+            )
+
+            return apply_nvfp4_humming_linear(layer, x, bias)
+
         if layer.use_flashinfer_bf16_fp4:
             from flashinfer import mm_bf16_fp4
 

@@ -58,6 +58,12 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.nvfp4_humming import (
+    apply_nvfp4_humming_linear,
+    nvfp4_humming_quant_mode,
+    prepare_moe_nvfp4_layer_for_humming,
+    prepare_nvfp4_layer_for_humming,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -843,7 +849,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
-        if hf_quant_config is None:
+        if hf_quant_config is None or user_quant == "humming":
             return None
         if hf_quant_config.get("quant_method", "") == "modelopt_mixed":
             return "modelopt_mixed"
@@ -1101,6 +1107,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
+                if get_fp4_gemm_runner_backend().is_humming():
+                    return ModelOptFp4LinearMethod(self.nvfp4a16_config)
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
             return UnquantizedLinearMethod()
 
@@ -1767,7 +1775,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             prefix,
             Linear=(
                 ModelOptNvFp4A16LinearMethod
-                if self.is_w4a16
+                if self.is_w4a16 and not get_fp4_gemm_runner_backend().is_humming()
                 else ModelOptFp4LinearMethod
             ),
             Moe=ModelOptNvFp4FusedMoEMethod,
@@ -1830,14 +1838,16 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        self.quant_mode = (
-            "w4a16"
-            if (
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-                and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
-            )
-            else "w4a4"
-        )
+        backend = get_fp4_gemm_runner_backend()
+        if backend.is_humming():
+            self.quant_mode = nvfp4_humming_quant_mode()
+        elif (
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            and backend.is_flashinfer_cutedsl()
+        ):
+            self.quant_mode = "w4a16"
+        else:
+            self.quant_mode = "w4a4"
 
     def create_weights(
         self,
@@ -1930,6 +1940,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_fp4_gemm_runner_backend().is_humming():
+            # ParallelLMHead retains the parent mixed-precision config; use
+            # the NVFP4 config selected for this method instead.
+            prepare_nvfp4_layer_for_humming(layer, self.quant_config.group_size)
+            return
+
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1977,7 +1993,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if not get_platform().is_blackwell:
             raise ValueError(
                 "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
-                "Use --fp4-gemm-backend marlin on SM80-SM90."
+                "Use --fp4-gemm-backend marlin on SM80-SM90 or humming on SM80+."
             )
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
@@ -2125,7 +2141,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_fp4_gemm_runner_backend().is_marlin():
+        backend = get_fp4_gemm_runner_backend()
+        if backend.is_humming():
+            return apply_nvfp4_humming_linear(
+                layer, x, bias, is_awq=self.quant_config.is_awq
+            )
+
+        if backend.is_marlin():
             return apply_fp4_marlin_linear(
                 input=x,
                 weight=layer.weight,
@@ -2405,6 +2427,22 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _resolve_nvfp4_moe_runner_backend(backend: MoeRunnerBackend) -> MoeRunnerBackend:
+    """Pick a concrete NVFP4 MoE runner when the requested backend is auto.
+
+    ``--fp4-gemm-backend humming`` selects the Humming MoE runner as well, so
+    dense and expert GEMMs stay on the same kernel. An explicit MoE backend wins.
+    """
+    if not backend.is_auto():
+        return backend
+    if get_fp4_gemm_runner_backend().is_humming():
+        return MoeRunnerBackend.HUMMING
+    if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+        return MoeRunnerBackend.MARLIN
+    # TRTLLM is currently the most performant and tested FP4 MoE backend.
+    return MoeRunnerBackend.FLASHINFER_TRTLLM
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2420,16 +2458,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             raise ValueError(
                 "NVFP4 MoE LoRA requires --moe-runner-backend lora_marlin."
             )
-        if (moe_runner_backend.is_auto() or moe_runner_backend.is_lora()) and is_cuda():
-            capability = get_device_capability()
-            use_marlin_fallback = (8, 0) <= capability < (10, 0)
-        else:
-            use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not get_platform().is_blackwell and not use_marlin_fallback:
+        resolved_backend = _resolve_nvfp4_moe_runner_backend(moe_runner_backend)
+        supports_non_blackwell = moe_runner_backend.is_marlin() or (
+            is_cuda()
+            and get_device_capability() >= (8, 0)
+            and (
+                resolved_backend.is_marlin()
+                or resolved_backend.is_lora_marlin()
+                or resolved_backend.is_humming()
+            )
+        )
+        if not get_platform().is_blackwell and not supports_non_blackwell:
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization with the selected MoE backend. Please use "
-                "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
+                " quantization with the selected MoE backend. Use Blackwell+, "
+                "moe_runner_backend=marlin or humming on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -2607,6 +2650,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_megamoe()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_lora_marlin()
+            or moe_runner_backend.is_humming()
             or moe_runner_backend.is_auto()
         )
         if skip_swizzled_blockscales:
@@ -2776,15 +2820,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             layer._w13_deinterleaved = True
 
-        if get_moe_a2a_backend().is_megamoe():
-            self._build_mega_moe_weights(layer)
-            return
-
-        # GEMM1 scale processing is deferred until the input scale is known;
-        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if get_moe_a2a_backend().is_megamoe():
+            if (
+                get_fp4_gemm_runner_backend().is_humming()
+                or moe_runner_backend.is_humming()
+            ):
+                raise ValueError("Humming does not support the MegaMoE NVFP4 path.")
+            self._build_mega_moe_weights(layer)
+            return
+
+        if moe_runner_backend.is_humming():
+            prepare_moe_nvfp4_layer_for_humming(
+                layer, group_size=self.quant_config.group_size
+            )
+            return
         if moe_runner_backend.is_lora_marlin():
             moe_runner_backend = MoeRunnerBackend.MARLIN
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
@@ -3168,16 +3220,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-
+        moe_runner_backend = _resolve_nvfp4_moe_runner_backend(get_moe_runner_backend())
         self._moe_runner_backend = moe_runner_backend
 
         if get_moe_a2a_backend().is_megamoe():
@@ -3290,6 +3333,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_humming():
+            from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
+
+            return self.runner.run(dispatch_output, HummingMoeQuantInfo(layer=layer))
 
         # FlashInfer TRTLLM FP4 path (routed shares the weight prep and the runner)
         if (

@@ -110,10 +110,14 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            # Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor.
+            # Marlin and Humming apply routed_scaling_factor inside their runners.
             and (
                 runner_backend is None
-                or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
+                or not (
+                    runner_backend.is_marlin()
+                    or runner_backend.is_lora_marlin()
+                    or runner_backend.is_humming()
+                )
             )
         )
         or (
