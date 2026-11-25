@@ -25,7 +25,7 @@ _REL_L2_TOL = 6e-3
 
 def _make_cache(num_rows, dim=512, seed=0):
     from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
-    from sglang.kernels.ops.attention.dsa.quant_k_cache import (
+    from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
         quantize_k_cache_separate,
     )
 
@@ -224,12 +224,32 @@ class TestTileLangFp8GroupScaledNope(CustomTestCase):
         out = self._run(q, cache, indices, 1.0 / math.sqrt(512))
         self.assertEqual(tuple(out.shape), (1, 0, 16, 512))
 
-    def test_rejects_non_nope_or_unscaled_rows(self):
-        """A raw 512-byte FP8 row or a 656-byte RoPE row must not be misread."""
+    def test_raw_nope_rows_use_fp8_path(self):
+        """Q8 prefill's raw NoPE rows must remain consumable by decode."""
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        cache = torch.randn(64, 1, 512, device="cuda", generator=generator).to(
+            torch.float8_e4m3fn
+        )
+        q = torch.randn(
+            1, 16, 512, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        indices = torch.arange(64, device="cuda", dtype=torch.int32).view(1, 1, 64)
+        actual = self._run(q, cache, indices, 1.0 / math.sqrt(512))
+        # The raw kernel also casts queries to FP8 before the QK GEMM.
+        expected = _reference(
+            q.to(torch.float8_e4m3fn).bfloat16(),
+            cache.bfloat16(),
+            indices,
+            1.0 / math.sqrt(512),
+        )
+        self.assert_rel_l2(actual, expected, tol=2e-2)
+
+    def test_rejects_invalid_nope_row_widths(self):
+        """Malformed raw or group-scaled NoPE row widths must not be misread."""
         sm_scale = 1.0 / math.sqrt(512)
         q = torch.randn(1, 16, 512, device="cuda", dtype=torch.bfloat16)
         indices = torch.zeros(1, 1, 64, device="cuda", dtype=torch.int32)
-        for width in (512, 656):
+        for width in (516, 656):
             with self.subTest(width=width):
                 cache = torch.zeros(8, 1, width, device="cuda").to(torch.float8_e4m3fn)
                 with self.assertRaisesRegex(ValueError, "group-scaled"):
