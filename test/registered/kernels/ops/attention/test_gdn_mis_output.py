@@ -723,6 +723,64 @@ class TestGDNMISOutput(CustomTestCase):
                 ):
                     chunk_gated_delta_rule(**(base | override))
 
+    @torch.inference_mode()
+    def test_identity_fused_prepare_matches_separate_and_10240_dim(self):
+        """Plain extend (token_indices=None) matches split + l2norm + gating, including 10240 dim."""
+        torch.manual_seed(77)
+        tokens = 32
+        for nq, nk, nv, dim in ((16, 16, 32, 128), (16, 16, 48, 128)):
+            with self.subTest(nq=nq, nk=nk, nv=nv, dim=dim):
+                qkv_dim = (nq + nk + nv) * dim
+                packed = torch.randn(
+                    tokens, qkv_dim, device="cuda", dtype=torch.bfloat16
+                )
+                A_log = torch.randn(nv, device="cuda", dtype=torch.float32) * 0.2
+                a = torch.randn(tokens, nv, device="cuda", dtype=torch.bfloat16)
+                b = torch.randn(tokens, nv, device="cuda", dtype=torch.bfloat16)
+                dt_bias = torch.randn(nv, device="cuda", dtype=torch.bfloat16) * 0.1
+
+                q, k, v, g, beta = fused_qkv_gating_gdn_prefill(
+                    packed,
+                    nq,
+                    nk,
+                    nv,
+                    dim,
+                    dim,
+                    dim,
+                    A_log=A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=dt_bias,
+                )
+                q0, k0, v0 = fused_qkv_split_gdn_prefill(
+                    packed, nq, nk, nv, dim, dim, dim
+                )
+                q0 = l2norm_fwd(q0)
+                k0 = l2norm_fwd(k0)
+                g0, beta0 = fused_gdn_gating(A_log, a, b, dt_bias)
+
+                torch.testing.assert_close(q, q0, rtol=0, atol=0)
+                torch.testing.assert_close(k, k0, rtol=0, atol=0)
+                torch.testing.assert_close(v, v0, rtol=0, atol=0)
+                torch.testing.assert_close(g, g0, rtol=0, atol=0)
+                torch.testing.assert_close(beta, beta0, rtol=0, atol=0)
+
+        # Row-count mismatch must raise when token_indices is omitted.
+        with self.assertRaisesRegex(ValueError, "a/b rows to match mixed_qkv"):
+            fused_qkv_gating_gdn_prefill(
+                torch.randn(4, 384, device="cuda", dtype=torch.bfloat16),
+                2,
+                2,
+                2,
+                64,
+                64,
+                64,
+                A_log=torch.zeros(2, device="cuda"),
+                a=torch.zeros(5, 2, device="cuda", dtype=torch.bfloat16),
+                b=torch.zeros(5, 2, device="cuda", dtype=torch.bfloat16),
+                dt_bias=torch.zeros(2, device="cuda", dtype=torch.bfloat16),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

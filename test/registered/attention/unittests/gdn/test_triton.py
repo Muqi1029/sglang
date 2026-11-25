@@ -329,11 +329,11 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
     def test_triton_prefill_keeps_contiguous_qkv_materialization(self):
         with patch.object(
             gdn_backend,
-            "fused_qkv_split_gdn_prefill",
-            wraps=gdn_backend.fused_qkv_split_gdn_prefill,
-        ) as split_spy:
+            "fused_qkv_gating_gdn_prefill",
+            wraps=gdn_backend.fused_qkv_gating_gdn_prefill,
+        ) as fused_spy:
             run_gdn_attention_case(self, self.CASES[0])
-        split_spy.assert_called()
+        fused_spy.assert_called()
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

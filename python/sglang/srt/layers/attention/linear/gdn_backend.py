@@ -81,7 +81,7 @@ if is_cuda() or is_hip() or is_xpu():
         fused_qkvzba_split_reshape_cat_contiguous,
     )
 
-MAX_FUSED_QKV_SPLIT_DIM = 8192
+MAX_FUSED_QKV_SPLIT_DIM = 10240
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -1324,7 +1324,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer: RadixLinearAttention, mixed_qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """forward_extend's q / k / v split for a plain extend on CUDA."""
-        if layer.q_dim + layer.k_dim + layer.v_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        if (
+            is_cuda() or is_hip() or is_xpu()
+        ) and layer.q_dim + layer.k_dim + layer.v_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             return fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1343,6 +1345,49 @@ class GDNAttnBackend(MambaAttnBackendBase):
             key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim),
             value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
         )
+
+    def _prepare_extend_qkv_and_gates(
+        self,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        bool,
+    ]:
+        """Split prefill QKV and compute gating (fused with Q/K L2Norm when eligible)."""
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if (
+            (is_cuda() or is_hip() or is_xpu())
+            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and not self.kernel_dispatcher.extend_kernel.defers_prefill_gates
+        ):
+            query, key, value, g, beta = fused_qkv_gating_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+                A_log=layer.A_log,
+                a=a,
+                b=b,
+                dt_bias=layer.dt_bias,
+            )
+            return query, key, value, g, beta, False
+        query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
+        if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
+            g = beta = None
+        else:
+            g, beta = self._prefill_gates(layer, a, b)
+        return query, key, value, g, beta, True
 
     def _forward_extend_in_graph(
         self,
@@ -1383,8 +1428,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             activation=layer.activation,
             block_table=meta.conv_block_table,
         ).transpose(0, 1)
-        query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
-        g, beta = self._prefill_gates(layer, a, b)
+        query, key, value, g, beta, use_qk_l2norm = self._prepare_extend_qkv_and_gates(
+            layer, mixed_qkv, a, b
+        )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1396,6 +1442,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=meta.cu_seqlens,
             chunk_indices=meta.chunk_indices,
             chunk_offsets=meta.chunk_offsets,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
         )
         if meta.track:
             gdn_track_ssm_state(
@@ -1533,33 +1580,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_cache_indices,
             )
 
-        actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
-            (is_cuda() or is_hip() or is_xpu())
-            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and not self._use_strided_target_verify_qkv
-        ):
-            query, key, value = fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
-
         if is_target_verify:
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            if (
+                (is_cuda() or is_hip() or is_xpu())
+                and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+                and not self._use_strided_target_verify_qkv
+            ):
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(
+                    1, actual_seq_len, layer.num_q_heads, layer.head_q_dim
+                )
+                key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(
+                    1, actual_seq_len, layer.num_v_heads, layer.head_v_dim
+                )
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
@@ -1620,10 +1670,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
-            if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
-                g = beta = None
-            else:
-                g, beta = self._prefill_gates(layer, a, b)
+            query, key, value, g, beta, use_qk_l2norm = (
+                self._prepare_extend_qkv_and_gates(layer, mixed_qkv, a, b)
+            )
             h_track_buf = None
             if (
                 forward_metadata.has_mamba_track_mask
@@ -1671,6 +1720,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if h_track_buf is not None
                     else None
                 ),
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
             )
 
             if is_npu() and last_recurrent_state is not None:
