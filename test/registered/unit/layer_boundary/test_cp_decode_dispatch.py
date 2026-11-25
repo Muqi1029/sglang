@@ -180,6 +180,55 @@ class TestCpDecodeDispatch(CustomTestCase):
                 if not fused:
                     self.assertEqual(self.unfused_sums, 8)
 
+    def test_glm_flash_dsa_and_kda_complete_verify_sum_once(self):
+        """GLM's DSA decode shards owe a sum even though prefill ATTN_TP is 1.
+
+        Exercise the model's real declarations: adding a slicing scope without
+        changing the boundary silently loses three quarters of a CP4 output.
+        KDA already uses TP and must not acquire a second reduction.
+        """
+        from sglang.srt.configs.glm5_next import Glm5NextTextConfig
+        from sglang.srt.models.glm5_next import Glm5NextDecoderLayer
+
+        config = Glm5NextTextConfig(
+            architectures=["Glm5NextForConditionalGeneration"],
+            index_topk=2048,
+            linear_attn_config={"kda_layers": [0]},
+        )
+        with get_parallel().override(enable_cp_tp_group_sharing=True):
+            for layer_id in (0, 3):
+                for enabled in (False, True):
+                    with (
+                        self.subTest(layer_id=layer_id, enabled=enabled),
+                        get_parallel().override(enable_cp_decode_attn_tp=enabled),
+                    ):
+                        attention, ffn = Glm5NextDecoderLayer.stage_facts(
+                            config, layer_id
+                        )
+                        attn, ffn = build_stages(
+                            (attention, Norm(False)), (ffn, Norm(False)), terminal=True
+                        )
+                        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+                            fb = SimpleNamespace(
+                                forward_mode=mode,
+                                attn_cp_metadata=None,
+                                input_ids=torch.arange(2),
+                                can_run_tbo=False,
+                            )
+                            batch.start(fb)
+                            initial = torch.arange(8).reshape(2, 4).float()
+                            hidden = attn.prepare(initial, fb)
+                            # The disabled DSA computes every head. KDA and
+                            # enabled DSA each produce one CP2 rank's half.
+                            partial = layer_id == 0 or enabled
+                            hidden = attn.finish(hidden / (2 if partial else 1), fb)
+                            before = self.unfused_sums
+                            hidden = ffn.prepare(hidden, fb)
+                            torch.testing.assert_close(
+                                hidden, initial * 2, rtol=0, atol=0
+                            )
+                            self.assertEqual(self.unfused_sums - before, int(partial))
+
     def test_unmodified_attention_does_not_leave_a_decode_sum(self):
         _, ffn = build_stages(
             (declare_attn(), Norm(False)),

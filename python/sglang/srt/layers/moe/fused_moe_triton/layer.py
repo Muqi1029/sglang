@@ -115,6 +115,12 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
                 runner_backend is None
                 or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
             )
+            and not getattr(
+                quant_method, "_moe_runner_backend", get_moe_runner_backend()
+            ).is_marlin()
+            and not getattr(
+                quant_method, "_moe_runner_backend", get_moe_runner_backend()
+            ).is_humming()
         )
         or (
             runner_backend is not None

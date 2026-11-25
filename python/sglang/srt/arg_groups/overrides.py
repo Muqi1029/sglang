@@ -588,11 +588,16 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
+    kv_lora_rank: Optional[int] = None,
+    qk_rope_head_dim: Optional[int] = None,
+    nope_group_scaled: Optional[bool] = None,
     dcp_size: int = 1,
 ) -> None:
-    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    """Validate DSA backends, including raw Q8 and group-scaled NoPE layouts.
+
+    ``nope_group_scaled`` marks BF16 NoPE models with a 128-aligned latent.
+    ``None`` leaves the group-scaled geometry check to callers with model data.
+    """
     from sglang.srt.configs.model_config import is_q8_raw_fp8_nope_layout
 
     chosen = {prefill_backend, decode_backend}
@@ -620,14 +625,41 @@ def _check_dsa_backend_constraints(
                 "triton with --dcp-size > 1."
             )
 
-    if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
-        return
     native_raw_nope = is_q8_raw_fp8_nope_layout(
         prefill_backend=prefill_backend,
         decode_backend=decode_backend,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
     )
+    cuda_fp8_tilelang = {"tilelang"} & chosen
+    # ``nope_group_scaled is None`` means the caller carries no model geometry
+    # (the legacy shim), so the pre-existing platform rules below apply instead
+    # of this CUDA-only group-scaled gate.
+    if (
+        not hip
+        and kv_cache_dtype == "fp8_e4m3"
+        and cuda_fp8_tilelang
+        and nope_group_scaled is not None
+        and not native_raw_nope
+    ):
+        # Both phases must read the same group-scaled NoPE rows; any other
+        # prefill/decode consumer expects a RoPE tail or a different layout.
+        if (
+            nope_group_scaled
+            and prefill_backend == decode_backend == "tilelang"
+            and dcp_size == 1
+        ):
+            return
+        raise ValueError(
+            "On CUDA, the tilelang DSA kernels accept an fp8_e4m3 KV cache only "
+            "for BF16 NoPE models (qk_rope_head_dim == 0, kv_lora_rank a multiple "
+            "of 128) with both --dsa-prefill-backend and --dsa-decode-backend set "
+            "to tilelang, --dcp-size 1 and HiSparse off. Otherwise use "
+            "--kv-cache-dtype bfloat16, or pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+    if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
+        return
     if not native_raw_nope and (
         prefill_backend != "tilelang" or decode_backend != "tilelang"
     ):
@@ -802,11 +834,19 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    model_config = model_config_of(view)
+    kv_lora_rank = getattr(model_config, "kv_lora_rank", None)
     _check_dsa_backend_constraints(
         kv_cache_dtype,
         prefill,
         decode,
         hip=get_platform().is_hip,
+        nope_group_scaled=(
+            getattr(model_config, "qk_rope_head_dim", None) == 0
+            and isinstance(kv_lora_rank, int)
+            and kv_lora_rank % 128 == 0
+            and getattr(model_config, "dtype", None) == torch.bfloat16
+        ),
         dcp_size=getattr(view, "dcp_size", 1) or 1,
         kv_lora_rank=model_config_of(view).kv_lora_rank,
         qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,

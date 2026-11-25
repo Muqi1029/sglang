@@ -3942,11 +3942,12 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # CUDA TileLang uses raw FP8 rows without per-block scales. Q8 prefill
-    # shares this layout only for 512-dim NoPE latents with TileLang decode.
+    # TileLang's NoPE-only route uses group-scaled rows. Q8 prefill instead
+    # shares raw 512-byte NoPE rows with TileLang decode.
     if (
         get_exec().kernel.dsa_prefill_backend == "tilelang"
         and get_exec().kernel.dsa_decode_backend == "tilelang"
+        and qk_rope_head_dim != 0
     ) or is_q8_raw_fp8_nope_layout(
         prefill_backend=get_exec().kernel.dsa_prefill_backend,
         decode_backend=get_exec().kernel.dsa_decode_backend,

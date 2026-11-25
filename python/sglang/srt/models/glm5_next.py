@@ -29,6 +29,10 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.cp_decode_attn_tp import (
+    can_defer_cp_decode_attn_tp,
+    get_cp_decode_attn_tp_ctx,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -42,6 +46,7 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -918,10 +923,20 @@ class Glm5NextDecoderLayer(nn.Module):
             declare_attn(
                 read=residual.attn_readout,
                 update=residual.attn_update,
-                tp_group=SumGroup.TP
-                if config.is_kda_layer(layer_id)
-                and linear_attn_parallel_group() == "tp"
-                else SumGroup.ATTN_TP,
+                tp_group=(
+                    SumGroup.TP
+                    if config.is_kda_layer(layer_id)
+                    and linear_attn_parallel_group() == "tp"
+                    else SumGroup.ATTN_TP
+                ),
+                ordinary_tp_group=(
+                    SumGroup.TP
+                    if not config.is_kda_layer(layer_id)
+                    and is_deepseek_dsa(config)
+                    and config.q_lora_rank is not None
+                    and can_defer_cp_decode_attn_tp()
+                    else None
+                ),
             ),
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
@@ -1048,23 +1063,36 @@ class Glm5NextDecoderLayer(nn.Module):
         # and the FFN run on the gathered rows and hand back this rank's rows.
         sp_active = get_forward().sp_active
 
-        if sp_active:
-            hidden_states, topk_indices = self._run_attn_sp(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-                prev_topk_indices=prev_topk_indices,
-            )
-        else:
-            hidden_states, topk_indices = self._run_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-                input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
-                prev_topk_indices=prev_topk_indices,
-            )
+        # KDA already partitions heads over TP. Only the replicated DSA
+        # projections switch from CP prefill to TP on ordinary rows, including
+        # DFLASH target verification and short extends that do not use CP.
+        with (
+            nullcontext()
+            if self.is_linear_attn
+            else self.self_attn.maybe_use_decode_attn_tp(forward_batch)
+        ):
+            if getattr(self.self_attn, "defer_cp_decode_attn_tp", False):
+                assert get_cp_decode_attn_tp_ctx().use_decode_attn_tp == (
+                    self.attn_boundary.plan.variant_for(forward_batch)
+                    is BatchVariant.ORDINARY
+                ), "CP decode weight dispatch disagrees with the boundary sum"
+            if sp_active:
+                hidden_states, topk_indices = self._run_attn_sp(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    zero_allocator=zero_allocator,
+                    prev_topk_indices=prev_topk_indices,
+                )
+            else:
+                hidden_states, topk_indices = self._run_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    zero_allocator=zero_allocator,
+                    input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
+                    prev_topk_indices=prev_topk_indices,
+                )
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1534,15 +1562,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if getattr(text_config, "n_shared_experts", None) != 1:
-            return "Shared experts fusion requires exactly one shared expert."
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        # Plain modelopt_fp4, or the FP8 + NVFP4 hybrid (HybridFp8NvFp4Config)
+        # whose NVFP4 exclude list lives on ``nvfp4_config``.
+        nvfp4_config = None
+        if quant_config is not None:
+            if quant_config.get_name() == "modelopt_fp4":
+                nvfp4_config = quant_config
+            else:
+                nvfp4_config = getattr(quant_config, "nvfp4_config", None)
+        if nvfp4_config is not None:
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
                 moe_prefix = f"model.layers.{layer_id}.mlp"
-                if quant_config.is_layer_excluded(
+                if nvfp4_config.is_layer_excluded(
                     f"{moe_prefix}.shared_experts"
-                ) and not quant_config.is_layer_excluded(f"{moe_prefix}.experts"):
+                ) and not nvfp4_config.is_layer_excluded(f"{moe_prefix}.experts"):
                     return (
                         "ModelOpt FP4 keeps shared experts unquantized while routed "
                         "experts are quantized."
@@ -1552,6 +1586,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
+        if get_moe_a2a_backend().is_deepep():
+            return (
+                "Shared experts fusion is not supported when Deepep MoE backend "
+                "is enabled."
+            )
+        if (
+            get_moe_runner_backend().is_marlin()
+            or get_moe_runner_backend().is_humming()
+        ):
+            return "Shared experts fusion is incompatible with humming or marlin."
 
         if _is_cuda:
             if _device_sm is not None and _device_sm < 80:
