@@ -616,6 +616,43 @@ def _validate_block_fp8_partition_shape(
     )
 
 
+def _load_unaligned_block_scale_shard(
+    layer, param, loaded_weight, shard_id, block_n: int
+) -> None:
+    """Load one fused-projection shard of block-FP8 scales.
+
+    A shard whose size is not a multiple of block_n (e.g. small K/V projections)
+    owns ceil(size / block_n) scale rows, which the default fused loaders miscount.
+    """
+    from sglang.srt.distributed.utils import get_group_rank_size
+
+    sizes = layer.output_partition_sizes
+    index = shard_id if isinstance(shard_id, int) else "qkv".index(shard_id)
+    size = sizes[index]
+    if getattr(layer, "use_presharded_weights", False):
+        rank = 0
+    elif shard_id in ("k", "v"):
+        kv_rank, _ = get_group_rank_size(layer.kv_tp_group)
+        rank = kv_rank // layer.num_kv_head_replicas
+    else:
+        rank, _ = get_group_rank_size(layer.tp_group)
+
+    # This rank owns checkpoint rows [start, start + size). A scale block that
+    # straddles two ranks cannot be expressed in the local block grid.
+    start = rank * size
+    first_block = start // block_n
+    if start % block_n and (start + size - 1) // block_n != first_block:
+        raise ValueError(
+            f"Block-FP8 shard {shard_id!r} (rows {start}..{start + size}) is not "
+            f"aligned to block size {block_n}; choose a different TP size."
+        )
+    rows = math.ceil(size / block_n)
+    offset = sum(math.ceil(s / block_n) for s in sizes[:index])
+    param.data[offset : offset + rows].copy_(
+        loaded_weight[first_block : first_block + rows]
+    )
+
+
 _MIXED_FUSED_PROJECTIONS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
@@ -1112,20 +1149,10 @@ class HummingLinearMethod(LinearMethodBase):
                 and name in ("weight_scale", "weight_scale_inv")
                 and any(s % block_size[0] != 0 for s in layer.output_partition_sizes)
             ):
-                block_n = block_size[0]
-                shard_index = (
-                    shard_id
-                    if isinstance(shard_id, int)
-                    else {"q": 0, "k": 1, "v": 2}[shard_id]
+                _load_unaligned_block_scale_shard(
+                    layer, param, loaded_weight, shard_id, block_size[0]
                 )
-                offset = sum(
-                    math.ceil(size / block_n)
-                    for size in layer.output_partition_sizes[:shard_index]
-                )
-                rows = math.ceil(layer.output_partition_sizes[shard_index] / block_n)
-                if param.data[offset : offset + rows].shape == loaded_weight.shape:
-                    param.data[offset : offset + rows].copy_(loaded_weight)
-                    return None
+                return None
             if shard_id is not None:
                 return weight_loader(param, loaded_weight, shard_id)
             return weight_loader(param, loaded_weight)
@@ -1264,22 +1291,9 @@ class HummingLinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if isinstance(x, tuple):
-            if self.weight_schema.hadamard_block_size > 1:
-                raise ValueError(
-                    "Pre-quantized FP8 tuple input requires hadamard_block_size <= 1."
-                )
-            q_fp8, token_scales = x
-            output = HummingMethod.forward_layer(
-                layer=layer,
-                inputs=q_fp8.reshape(-1, q_fp8.size(-1)),
-                input_scale=token_scales,
-                compute_config=self.compute_config,
-            )
-            return output.reshape(*q_fp8.shape[:-1], output.size(-1))
         flatten_inputs = x.view(-1, x.size(-1))
         output = HummingMethod.forward_layer(
             layer=layer,

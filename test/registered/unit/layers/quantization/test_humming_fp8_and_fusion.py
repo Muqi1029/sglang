@@ -1,4 +1,4 @@
-"""Unit coverage for model-agnostic Humming FP8 and SiLU+FP8 fusion optimizations."""
+"""Unit coverage for the Humming FP8 backend and MoE SiLU+FP8 fusion."""
 
 import unittest
 from unittest.mock import patch
@@ -11,11 +11,7 @@ pytest.importorskip("humming")
 from humming import dtypes  # noqa: E402
 from humming.config import GemmType  # noqa: E402
 
-from sglang.srt.layers.activation import SiluAndMul  # noqa: E402
-from sglang.srt.layers.linear import (  # noqa: E402
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import MergedColumnParallelLinear  # noqa: E402
 from sglang.srt.layers.logits_processor import (  # noqa: E402
     should_apply_lm_head_quant_method,
 )
@@ -38,10 +34,8 @@ from sglang.srt.layers.quantization.modelopt_quant import (  # noqa: E402
     ModelOptFp8LinearMethod,
 )
 from sglang.srt.layers.quantization.nvfp4_humming import (  # noqa: E402
-    can_fuse_silu_and_mul_humming_fp8,
     prepare_fp8_layer_for_humming,
     prepare_moe_nvfp4_layer_for_humming,
-    silu_and_mul_humming_fp8_quant,
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead  # noqa: E402
 from sglang.srt.runtime_context import (  # noqa: E402
@@ -90,7 +84,8 @@ class TestHummingFp8AndFusion(CustomTestCase):
             "sglang.srt.layers.quantization.modelopt_quant.get_fp8_gemm_runner_backend"
         )
         with patch(fp8_backend_path, return_value=Fp8GemmRunnerBackend.HUMMING):
-            # 1. Static per-tensor FP8 with unaligned K and bias.
+            # 1. Static FP8 with unaligned K, bias, and distinct shard scales
+            #    (kept as channel scales, not requantized to the max scale).
             with torch.device("cuda"):
                 layer = MergedColumnParallelLinear(
                     input_size=258,
@@ -105,9 +100,7 @@ class TestHummingFp8AndFusion(CustomTestCase):
                 raw_w = (torch.randn(258, 258, device="cuda") * 4.0).to(
                     torch.float8_e4m3fn
                 )
-                w_scale = torch.tensor(
-                    [0.125, 0.25], dtype=torch.float32, device="cuda"
-                )
+                w_scale = torch.tensor([0.1, 0.25], dtype=torch.float32, device="cuda")
                 in_scale = torch.tensor([0.5, 0.5], dtype=torch.float32, device="cuda")
                 layer.weight.data.copy_(raw_w)
                 layer.weight_scale.data.copy_(w_scale)
@@ -120,14 +113,14 @@ class TestHummingFp8AndFusion(CustomTestCase):
                 x_q = (x.float() / 0.5).to(torch.float8_e4m3fn).float() * 0.5
                 w_deq = torch.cat(
                     [
-                        raw_w[:128].float() * 0.125,
+                        raw_w[:128].float() * 0.1,
                         raw_w[128:].float() * 0.25,
                     ],
                     dim=0,
                 )
                 ref = (x_q @ w_deq.t()).to(torch.bfloat16) + layer.bias
                 rel = (out.float() - ref.float()).norm() / ref.float().norm()
-                self.assertLess(rel.item(), 0.03)
+                self.assertLess(rel.item(), 0.01)
 
             # 2. Channel scale & dynamic_token (no input_scale) on raw Module.
             dyn_mod = torch.nn.Module()
@@ -169,8 +162,7 @@ class TestHummingFp8AndFusion(CustomTestCase):
         with self.assertRaises(RuntimeError):
             _dispatch_explicit_backend(Fp8GemmRunnerBackend.HUMMING)
 
-    def test_dense_silu_humming_fp8_fusion_tuple_input_and_f16_accum(self):
-        torch.manual_seed(7)
+    def test_nvfp4_lm_head_excluded_from_f16_accum(self):
         fp4_cfg = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             group_size=16,
@@ -180,81 +172,26 @@ class TestHummingFp8AndFusion(CustomTestCase):
         backend_path = (
             "sglang.srt.layers.quantization.modelopt_quant.get_fp4_gemm_runner_backend"
         )
-        act_fn = SiluAndMul()
-        for use_f16_accum in (False, True):
-            prev_dtype = torch.get_default_dtype()
-            torch.set_default_dtype(torch.bfloat16)
-            try:
-                with (
-                    self.subTest(use_f16_accum=use_f16_accum),
-                    patch(backend_path, return_value=Fp4GemmRunnerBackend.HUMMING),
-                    patch.dict(
-                        "os.environ",
-                        {"SGLANG_HUMMING_USE_F16_ACCUM": "1" if use_f16_accum else "0"},
-                    ),
-                    get_parallel().override(tp_group=None),
-                    torch.device("cuda"),
-                ):
-                    gate_up_proj = MergedColumnParallelLinear(
-                        input_size=256,
-                        output_sizes=[256, 256],
-                        bias=False,
-                        params_dtype=torch.bfloat16,
-                        quant_config=fp4_cfg,
-                        parallel_group="replicated",
-                    )
-                    down_proj = RowParallelLinear(
-                        input_size=256,
-                        output_size=256,
-                        bias=False,
-                        input_is_parallel=True,
-                        reduce_results=False,
-                        params_dtype=torch.bfloat16,
-                        quant_config=fp4_cfg,
-                        parallel_group="replicated",
-                    )
-                    for proj in (gate_up_proj, down_proj):
-                        _fill_nvfp4_linear(proj)
-                        proj.quant_method.process_weights_after_loading(proj)
-
-                    self.assertTrue(can_fuse_silu_and_mul_humming_fp8(down_proj))
-                    x = torch.randn(6, 256, dtype=torch.bfloat16, device="cuda")
-
-                    # Fused SiLU+Mul+DynamicTokenFP8 tuple path.
-                    if use_f16_accum:
-                        gate_up_proj._humming_keep_f16_output = True
-                    gate_up_fused, _ = gate_up_proj(x)
-                    out_fused, _ = down_proj(
-                        silu_and_mul_humming_fp8_quant(down_proj, gate_up_fused)
-                    )
-                    self.assertEqual(out_fused.dtype, torch.bfloat16)
-
-                    # Compare against unfused execution.
-                    gate_up_proj._humming_keep_f16_output = False
-                    gate_up_unfused, _ = gate_up_proj(x)
-                    out_unfused, _ = down_proj(act_fn(gate_up_unfused))
-                    rel = (out_fused.float() - out_unfused.float()).norm() / (
-                        out_unfused.float().norm() + 1e-6
-                    )
-                    self.assertLess(rel.item(), 0.05)
-
-                    # lm_head stays excluded from BF16 f16_accum and executes cleanly.
-                    lm_head = ParallelLMHead(
-                        num_embeddings=512,
-                        embedding_dim=256,
-                        params_dtype=torch.bfloat16,
-                        quant_config=fp4_cfg,
-                        enable_tp=False,
-                    )
-                    _fill_nvfp4_linear(lm_head)
-                    lm_head.quant_method.process_weights_after_loading(lm_head)
-                    self.assertIsNone(getattr(lm_head, "_humming_output_dtype", None))
-                    self.assertEqual(lm_head.humming_metas[""].c_dtype, dtypes.bfloat16)
-                    logits = lm_head.quant_method.apply(lm_head, x)
-                    self.assertEqual(logits.dtype, torch.bfloat16)
-                    self.assertEqual(logits.shape, (6, 512))
-            finally:
-                torch.set_default_dtype(prev_dtype)
+        with (
+            patch(backend_path, return_value=Fp4GemmRunnerBackend.HUMMING),
+            patch.dict("os.environ", {"SGLANG_HUMMING_USE_F16_ACCUM": "1"}),
+            torch.device("cuda"),
+        ):
+            lm_head = ParallelLMHead(
+                num_embeddings=512,
+                embedding_dim=256,
+                params_dtype=torch.bfloat16,
+                quant_config=fp4_cfg,
+                enable_tp=False,
+            )
+            _fill_nvfp4_linear(lm_head)
+            lm_head.quant_method.process_weights_after_loading(lm_head)
+            self.assertIsNone(getattr(lm_head, "_humming_output_dtype", None))
+            self.assertEqual(lm_head.humming_metas[""].c_dtype, dtypes.bfloat16)
+            x = torch.randn(6, 256, dtype=torch.bfloat16)
+            logits = lm_head.quant_method.apply(lm_head, x)
+            self.assertEqual(logits.dtype, torch.bfloat16)
+            self.assertEqual(logits.shape, (6, 512))
 
     def test_moe_runner_silu_fp8_fusion_non_aliasing_and_f16_accum(self):
         torch.manual_seed(11)

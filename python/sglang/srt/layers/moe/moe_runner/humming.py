@@ -44,7 +44,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.layers.quantization.nvfp4_humming import HUMMING_SILU_AND_MUL_EXPR
+# Humming "binary_split" activation: a = gate half, b = up half.
+_SILU_AND_MUL_EXPR = "(a / (1.0f + __expf(-a))) * b"
 
 try:
     from humming import dtypes
@@ -493,7 +494,7 @@ class HummingRunnerCore(MoeRunnerCore):
                 inputs=buffers["gate_up_output"],
                 outputs=buffers.get("quanted_down_input"),
                 activation_type="binary_split",
-                activation_impl=HUMMING_SILU_AND_MUL_EXPR,
+                activation_impl=_SILU_AND_MUL_EXPR,
                 hadamard_block_size=0,
                 m_major_scale=False,
                 sublayer_name="w2",

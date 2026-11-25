@@ -27,22 +27,16 @@ _PAD_N = 256
 _PAD_K = 128
 _REQUANT_CHUNK_N = 16384
 _NUM_STREAM_K_LOCKS = 2048
-HUMMING_SILU_AND_MUL_EXPR = "(a / (1.0f + __expf(-a))) * b"
-
-
-def nvfp4_humming_uses_fp8_activations() -> bool:
-    """SM89 and newer Humming NVFP4 uses dynamic FP8 activations."""
-    return get_device_capability() >= _SM89
 
 
 def humming_fp8_supported() -> bool:
-    """Humming FP8 kernels require CUDA SM89+ tensor cores."""
+    """Humming FP8 kernels (W8A8, and W4A8 for NVFP4) require CUDA SM89+."""
     return is_cuda() and get_device_capability() >= _SM89
 
 
 def nvfp4_humming_quant_mode() -> str:
     # Ampere has no FP8 tensor cores, so it keeps the layer's BF16/FP16 input.
-    return "w4a8" if nvfp4_humming_uses_fp8_activations() else "w4a16"
+    return "w4a8" if humming_fp8_supported() else "w4a16"
 
 
 def _should_use_f16_accum(
@@ -82,7 +76,7 @@ def _finalize_humming_dense_layer(
 def prepare_nvfp4_layer_for_humming(layer: torch.nn.Module, group_size: int) -> None:
     """Repack one dense NVFP4 linear into the Humming weight layout."""
     _validate_nvfp4_humming(group_size, "NVFP4 Humming")
-    use_fp8 = nvfp4_humming_uses_fp8_activations()
+    use_fp8 = humming_fp8_supported()
     orig_dtype = layer.params_dtype
     use_f16_accum = _should_use_f16_accum(layer, use_fp8=use_fp8, orig_dtype=orig_dtype)
     compute_dtype = torch.float16 if use_f16_accum else orig_dtype
@@ -126,9 +120,9 @@ def prepare_fp8_layer_for_humming(layer: torch.nn.Module) -> None:
     shape_k = getattr(layer, "input_size_per_partition", layer.weight.shape[1])
 
     weight = layer.weight.data.contiguous()
-    meta_shape_n = round_up(shape_n, 8) if shape_n % 8 != 0 else shape_n
+    meta_shape_n = round_up(shape_n, 8)
     # W8A8 tensor cores require K padded to a multiple of 128 // a_bits (= 16).
-    meta_shape_k = round_up(shape_k, 16) if shape_k % 16 != 0 else shape_k
+    meta_shape_k = round_up(shape_k, 16)
     if meta_shape_k != shape_k or meta_shape_n != shape_n:
         weight = torch.nn.functional.pad(
             weight, (0, meta_shape_k - shape_k, 0, meta_shape_n - shape_n)
@@ -205,21 +199,16 @@ def prepare_fp8_layer_for_humming(layer: torch.nn.Module) -> None:
     _finalize_humming_dense_layer(layer, use_f16_accum=False, output_dtype=None)
 
 
-def _apply_humming_linear(
+def apply_humming_linear(
     layer: torch.nn.Module,
-    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    x: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Run a dense linear prepared by the prepare_*_layer_for_humming helpers."""
     from humming.forward import humming_forward
 
-    if isinstance(x, tuple):
-        tensor_in, input_scale = x
-    else:
-        tensor_in = x
-        input_scale = getattr(layer, "input_scale", None)
-
-    leading_shape = tensor_in.shape[:-1]
-    x_2d = tensor_in.reshape(-1, tensor_in.shape[-1])
+    leading_shape = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1])
     padded_k = getattr(layer, "_humming_padded_k", None)
     if padded_k is not None and padded_k > x_2d.shape[-1]:
         x_2d = torch.nn.functional.pad(x_2d, (0, padded_k - x_2d.shape[-1]))
@@ -229,7 +218,7 @@ def _apply_humming_linear(
         inputs=x_2d,
         weight=layer.weight,
         weight_scale=layer.weight_scale,
-        input_scale=input_scale,
+        input_scale=getattr(layer, "input_scale", None),
         locks=layer.locks,
         compute_config=getattr(layer, "_humming_compute_config", None),
     )
@@ -238,87 +227,11 @@ def _apply_humming_linear(
         output = output[:, :output_size]
     output = output.reshape(*leading_shape, output_size)
     output_dtype = getattr(layer, "_humming_output_dtype", None)
-    if (
-        output_dtype is not None
-        and output.dtype != output_dtype
-        and not getattr(layer, "_humming_keep_f16_output", False)
-    ):
+    if output_dtype is not None:
         output = output.to(output_dtype)
     if bias is not None:
-        if bias.dtype != output.dtype:
-            bias = bias.to(output.dtype)
-        output = output + bias
+        output = output + bias.to(output.dtype)
     return output
-
-
-def apply_nvfp4_humming_linear(
-    layer: torch.nn.Module,
-    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    bias: torch.Tensor | None = None,
-    *,
-    is_awq: bool = False,
-) -> torch.Tensor:
-    if isinstance(x, tuple):
-        if is_awq:
-            raise ValueError(
-                "Pre-quantized FP8 tuple input is not supported with AWQ pre_quant_scale."
-            )
-        return _apply_humming_linear(layer, x, bias)
-    if is_awq:
-        x = x * layer.pre_quant_scale
-    return _apply_humming_linear(layer, x, bias)
-
-
-def apply_fp8_humming_linear(
-    layer: torch.nn.Module,
-    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return _apply_humming_linear(layer, x, bias)
-
-
-def can_fuse_silu_and_mul_humming_fp8(down_proj: torch.nn.Module) -> bool:
-    """Whether down_proj consumes a fused SiLU+Mul+DynamicTokenFP8 tuple."""
-    from humming import dtypes
-    from humming.config import InputQuantizationMode
-
-    if (
-        not hasattr(down_proj, "humming_metas")
-        or "" not in down_proj.humming_metas
-        or hasattr(down_proj, "base_layer")
-        or hasattr(down_proj, "pre_quant_scale")
-        or not getattr(down_proj, "input_is_parallel", True)
-        or getattr(down_proj, "_humming_padded_k", None) is not None
-    ):
-        return False
-    meta = down_proj.humming_metas[""]
-    quant_method = getattr(down_proj, "quant_method", None)
-    weight_schema = getattr(quant_method, "weight_schema", None)
-    hadamard_block_size = (
-        getattr(weight_schema, "hadamard_block_size", 0) or 0
-        if weight_schema is not None
-        else 0
-    )
-    return (
-        meta.a_dtype == dtypes.float8e4m3
-        and meta.input_quant_mode == InputQuantizationMode.DynamicToken
-        and hadamard_block_size <= 1
-    )
-
-
-def silu_and_mul_humming_fp8_quant(
-    down_proj: torch.nn.Module, gate_up: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute SiLU(gate) * up and dynamic per-token FP8 quant for down_proj."""
-    from humming.forward import may_process_input
-
-    q_fp8, _, token_scales = may_process_input(
-        down_proj.humming_metas[""],
-        gate_up.reshape(-1, gate_up.shape[-1]),
-        activation_type="binary_split",
-        activation_impl=HUMMING_SILU_AND_MUL_EXPR,
-    )
-    return q_fp8.reshape(*gate_up.shape[:-1], q_fp8.shape[-1]), token_scales
 
 
 def prepare_moe_nvfp4_layer_for_humming(
@@ -338,7 +251,7 @@ def prepare_moe_nvfp4_layer_for_humming(
     )
 
     use_deepep_fp8_dispatch = configure_humming_deepep_dispatch(layer)
-    use_fp8 = nvfp4_humming_uses_fp8_activations()
+    use_fp8 = humming_fp8_supported()
     use_f16_accum = _should_use_f16_accum(
         layer, use_fp8=use_fp8, orig_dtype=layer.params_dtype
     )

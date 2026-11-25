@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.humming import (  # noqa: E402
     HummingLinearMethod,
     HummingMoEMethod,
     _convert_humming_tensors,
+    _load_unaligned_block_scale_shard,
     _StackedBlockFp8CheckpointWeightSchema,
     _W4AFp8CheckpointWeightSchema,
 )
@@ -176,6 +177,30 @@ class TestStackedBlockFp8Schema(CustomTestCase):
             shape_n=96, shape_k=384, param_dtype=torch.bfloat16, num_experts=4
         )
         self.assertEqual(attrs["weight_scale_inv"]["shape"], (4, 1, 3))
+
+    def test_unaligned_block_scale_shards_follow_tp_rank(self):
+        # TP=2, rank 1: local q=256 rows (2 blocks), k=v=64 rows (inside block 0).
+        group = SimpleNamespace(rank_in_group=1, world_size=2)
+        layer = SimpleNamespace(
+            output_partition_sizes=[256, 64, 64],
+            tp_group=group,
+            kv_tp_group=group,
+            num_kv_head_replicas=1,
+        )
+        param = torch.zeros(4, 2)
+        q_scale = torch.arange(8.0).view(4, 2)
+        _load_unaligned_block_scale_shard(layer, param, q_scale, "q", 128)
+        _load_unaligned_block_scale_shard(layer, param, torch.ones(1, 2), "k", 128)
+        _load_unaligned_block_scale_shard(
+            layer, param, torch.full((1, 2), 2.0), "v", 128
+        )
+        torch.testing.assert_close(param[:2], q_scale[2:])
+        torch.testing.assert_close(param[2:], torch.tensor([[1.0, 1.0], [2.0, 2.0]]))
+
+        # Rank 1 of a 192-row shard starts mid-block and spans two blocks.
+        layer.output_partition_sizes = [192]
+        with self.assertRaises(ValueError):
+            _load_unaligned_block_scale_shard(layer, param, q_scale, 0, 128)
 
 
 class TestHummingSchemaConversion(CustomTestCase):

@@ -60,8 +60,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.nvfp4_humming import (
-    apply_fp8_humming_linear,
-    apply_nvfp4_humming_linear,
+    apply_humming_linear,
     humming_fp8_supported,
     nvfp4_humming_quant_mode,
     prepare_fp8_layer_for_humming,
@@ -636,20 +635,26 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
-        max_w_scale, quantized_weight = requantize_with_max_scale(
-            layer.weight, layer.weight_scale, layer.logical_widths
-        )
         if self.use_humming:
-            layer.weight = Parameter(
-                quantized_weight.data.contiguous(), requires_grad=False
-            )
-            layer.weight_scale = Parameter(max_w_scale.data, requires_grad=False)
+            # Humming takes per-channel scales, so fused projections keep their
+            # checkpoint weights instead of being requantized to the max scale.
+            weight_scale = layer.weight_scale.data
+            if torch.all(weight_scale == weight_scale[0]):
+                weight_scale = weight_scale[:1]
+            else:
+                weight_scale = convert_to_channelwise(
+                    weight_scale, layer.logical_widths
+                )
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             if getattr(layer, "input_scale", None) is not None:
                 layer.input_scale = Parameter(
                     layer.input_scale.data.max(), requires_grad=False
                 )
             prepare_fp8_layer_for_humming(layer)
             return
+        max_w_scale, quantized_weight = requantize_with_max_scale(
+            layer.weight, layer.weight_scale, layer.logical_widths
+        )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
         layer.use_flashinfer_bmm = self._can_use_flashinfer_bmm(layer)
         if self.cutlass_fp8_supported and not layer.use_flashinfer_bmm:
@@ -680,7 +685,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
         if self.use_humming:
-            return apply_fp8_humming_linear(layer, x, bias=bias)
+            return apply_humming_linear(layer, x, bias)
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -2171,9 +2176,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         backend = get_fp4_gemm_runner_backend()
         if backend.is_humming():
-            return apply_nvfp4_humming_linear(
-                layer, x, bias, is_awq=self.quant_config.is_awq
-            )
+            if self.quant_config.is_awq:
+                x = x * layer.pre_quant_scale
+            return apply_humming_linear(layer, x, bias)
 
         if backend.is_marlin():
             return apply_fp4_marlin_linear(

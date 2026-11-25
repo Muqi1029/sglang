@@ -269,10 +269,10 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         if getattr(layer, "use_humming", False):
             from sglang.srt.layers.quantization.nvfp4_humming import (
-                apply_nvfp4_humming_linear,
+                apply_humming_linear,
             )
 
-            return apply_nvfp4_humming_linear(layer, x, bias)
+            return apply_humming_linear(layer, x, bias)
 
         if layer.use_flashinfer_bf16_fp4:
             from flashinfer import mm_bf16_fp4
