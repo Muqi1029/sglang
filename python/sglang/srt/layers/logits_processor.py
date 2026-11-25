@@ -1909,18 +1909,24 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     # Some draft models share an unquantized target lm_head tensor while still
     # carrying the draft model's stale ModelOpt quant_method. Only use the
     # ModelOpt lm_head kernel when the runtime quantization state matches it.
-    if method_name == "ModelOptFp4LinearMethod":
-        # Humming W4A16 shares quant_mode "w4a16" with the FlashInfer path;
-        # humming_metas is installed only after Humming weight preparation.
+    if method_name in ("ModelOptFp4LinearMethod", "ModelOptFp8LinearMethod"):
+        # Humming stores packed int32 weights + humming_metas + locks.
         if hasattr(lm_head, "humming_metas"):
+            required_attrs = (
+                "weight_scale",
+                "locks",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            )
+            if lm_head.humming_metas[""].input_quant_mode.has_tensor_scale:
+                required_attrs = required_attrs + ("input_scale",)
             return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-                lm_head,
-                (
-                    "weight_scale",
-                    "locks",
-                    "input_size_per_partition",
-                    "output_size_per_partition",
-                ),
+                lm_head, required_attrs
+            )
+        if method_name == "ModelOptFp8LinearMethod":
+            return (
+                lm_head.weight.dtype == torch.float8_e4m3fn
+                and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
             )
         if quant_method.quant_mode == "w4a16":
             return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
@@ -1963,11 +1969,6 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
                 "input_size_per_partition",
                 "output_size_per_partition",
             ),
-        )
-    if method_name == "ModelOptFp8LinearMethod":
-        return (
-            lm_head.weight.dtype == torch.float8_e4m3fn
-            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
         )
 
     return True

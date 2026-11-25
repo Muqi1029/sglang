@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.layers.quantization.nvfp4_humming import HUMMING_SILU_AND_MUL_EXPR
 
 try:
     from humming import dtypes
@@ -141,7 +142,7 @@ def humming_moe_runner_core_run(
 ) -> torch.Tensor:
     runner = HummingRunnerCore.runner_cores[moe_runner_id]
     if gemm_type == "indexed":
-        return runner._run_indexed_gemm(
+        result = runner._run_indexed_gemm(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -149,7 +150,7 @@ def humming_moe_runner_core_run(
             apply_routed_scaling_factor=apply_routed_scaling_factor,
         )
     elif gemm_type == "grouped_contiguous":
-        return runner._run_grouped_contiguous_gemm(
+        result = runner._run_grouped_contiguous_gemm(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -158,7 +159,7 @@ def humming_moe_runner_core_run(
         )
     elif gemm_type == "grouped_masked":
         assert expected_m is not None and expert_num_tokens is not None
-        return runner._run_grouped_masked_gemm(
+        result = runner._run_grouped_masked_gemm(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -168,6 +169,7 @@ def humming_moe_runner_core_run(
         )
     else:
         raise ValueError(f"Unknown gemm type: {gemm_type}")
+    return result.to(output_dtype) if result.dtype != output_dtype else result
 
 
 class HummingRunnerCore(MoeRunnerCore):
@@ -311,7 +313,10 @@ class HummingRunnerCore(MoeRunnerCore):
         if gate_up_dtype.num_bits != 16:
             required_buffers.append("quanted_gate_up_input")
         required_buffers.append("gate_up_output")
-        required_buffers.append("activation_output")
+        # Fused SiLU+mul+FP8 skips activation_output so gate_up_output and
+        # quanted_down_input never share the same workspace buffer.
+        if not self._can_fuse_silu_and_mul_w2():
+            required_buffers.append("activation_output")
         if down_dtype.num_bits != 16:
             required_buffers.append("quanted_down_input")
         required_buffers.append("down_output")
@@ -468,6 +473,43 @@ class HummingRunnerCore(MoeRunnerCore):
         weight_schema = weight_schemas.get(sublayer_name)
         return getattr(weight_schema, "hadamard_block_size", 0) or 0
 
+    def _can_fuse_silu_and_mul_w2(self) -> bool:
+        if self.activation != "silu" or self.swiglu_limit is not None:
+            return False
+        if self._get_hadamard_block_size("w2") > 1:
+            return False
+        w2_meta = self.layer.humming_metas["w2"]
+        return (
+            w2_meta.a_dtype == dtypes.float8e4m3
+            and w2_meta.input_quant_mode == InputQuantizationMode.DynamicToken
+        )
+
+    def _apply_activation_and_prepare_w2(
+        self, buffers: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if self._can_fuse_silu_and_mul_w2():
+            inputs, _, token_scales = HummingMethod.may_process_input(
+                layer=self.layer,
+                inputs=buffers["gate_up_output"],
+                outputs=buffers.get("quanted_down_input"),
+                activation_type="binary_split",
+                activation_impl=HUMMING_SILU_AND_MUL_EXPR,
+                hadamard_block_size=0,
+                m_major_scale=False,
+                sublayer_name="w2",
+            )
+            return inputs, token_scales, None
+
+        self.apply_activation(
+            inputs=buffers["gate_up_output"],
+            outputs=buffers["activation_output"],
+        )
+        return self._prepare_input(
+            inputs=buffers["activation_output"],
+            quanted_input=buffers.get("quanted_down_input"),
+            sublayer_name="w2",
+        )
+
     def _grouped_masked_act_quant(
         self,
         gate_up: torch.Tensor,
@@ -516,15 +558,7 @@ class HummingRunnerCore(MoeRunnerCore):
             )
             return down_input.flatten(0, 1), down_scale.flatten(0, 1), None
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-        return self._prepare_input(
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input"),
-            sublayer_name="w2",
-        )
+        return self._apply_activation_and_prepare_w2(buffers)
 
     def run(
         self,
@@ -640,15 +674,8 @@ class HummingRunnerCore(MoeRunnerCore):
             **moe_kwargs1,
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale, input_scale_2 = self._prepare_input(
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input"),
-            sublayer_name="w2",
+        inputs, input_scale, input_scale_2 = self._apply_activation_and_prepare_w2(
+            buffers
         )
 
         HummingMethod.forward_layer(
@@ -738,15 +765,8 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w13",
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale, input_scale_2 = self._prepare_input(
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input"),
-            sublayer_name="w2",
+        inputs, input_scale, input_scale_2 = self._apply_activation_and_prepare_w2(
+            buffers
         )
 
         HummingMethod.forward_layer(

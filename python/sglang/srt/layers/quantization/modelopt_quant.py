@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     flashinfer_per_tensor_fp8_supported,
+    get_fp8_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
@@ -59,8 +60,11 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.nvfp4_humming import (
+    apply_fp8_humming_linear,
     apply_nvfp4_humming_linear,
+    humming_fp8_supported,
     nvfp4_humming_quant_mode,
+    prepare_fp8_layer_for_humming,
     prepare_moe_nvfp4_layer_for_humming,
     prepare_nvfp4_layer_for_humming,
 )
@@ -551,16 +555,27 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__()
         self.quant_config = quant_config
+        self.use_humming = get_fp8_gemm_runner_backend().is_humming()
+        if self.use_humming and not humming_fp8_supported():
+            raise RuntimeError(
+                "FP8 GEMM backend 'humming' requires CUDA SM89+ (Ada/Hopper/Blackwell)."
+            )
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.enable_flashinfer_bmm = flashinfer_per_tensor_fp8_supported()
+        self.enable_flashinfer_bmm = (
+            False if self.use_humming else flashinfer_per_tensor_fp8_supported()
+        )
         self.use_marlin = False
-        if is_cuda():
+        if not self.use_humming and is_cuda():
             self.use_marlin = (
                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
             )
         # The SM12x facade selects the best qualified small-M FP8 kernel.
         cuda_capability = torch.cuda.get_device_capability() if is_cuda() else None
-        self.use_sm120_fp8 = cuda_capability is not None and cuda_capability[0] == 12
+        self.use_sm120_fp8 = (
+            not self.use_humming
+            and cuda_capability is not None
+            and cuda_capability[0] == 12
+        )
 
     def create_weights(
         self,
@@ -624,6 +639,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
+        if self.use_humming:
+            layer.weight = Parameter(
+                quantized_weight.data.contiguous(), requires_grad=False
+            )
+            layer.weight_scale = Parameter(max_w_scale.data, requires_grad=False)
+            if getattr(layer, "input_scale", None) is not None:
+                layer.input_scale = Parameter(
+                    layer.input_scale.data.max(), requires_grad=False
+                )
+            prepare_fp8_layer_for_humming(layer)
+            return
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
         layer.use_flashinfer_bmm = self._can_use_flashinfer_bmm(layer)
         if self.cutlass_fp8_supported and not layer.use_flashinfer_bmm:
@@ -653,6 +679,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if self.use_humming:
+            return apply_fp8_humming_linear(layer, x, bias=bias)
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

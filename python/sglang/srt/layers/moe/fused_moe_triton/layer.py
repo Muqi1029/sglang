@@ -676,7 +676,9 @@ class FusedMoE(torch.nn.Module):
         self.swiglu_alpha = gemm1_alpha
         self.swiglu_clamp_limit = gemm1_clamp_limit
 
-        if self.use_flashinfer_trtllm_moe:
+        if self.use_flashinfer_trtllm_moe or (
+            self.runner_backend is not None and self.runner_backend.is_humming()
+        ):
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (

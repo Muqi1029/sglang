@@ -1264,9 +1264,22 @@ class HummingLinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple):
+            if self.weight_schema.hadamard_block_size > 1:
+                raise ValueError(
+                    "Pre-quantized FP8 tuple input requires hadamard_block_size <= 1."
+                )
+            q_fp8, token_scales = x
+            output = HummingMethod.forward_layer(
+                layer=layer,
+                inputs=q_fp8.reshape(-1, q_fp8.size(-1)),
+                input_scale=token_scales,
+                compute_config=self.compute_config,
+            )
+            return output.reshape(*q_fp8.shape[:-1], output.size(-1))
         flatten_inputs = x.view(-1, x.size(-1))
         output = HummingMethod.forward_layer(
             layer=layer,

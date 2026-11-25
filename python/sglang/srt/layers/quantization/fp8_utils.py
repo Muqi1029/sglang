@@ -466,6 +466,7 @@ class Fp8GemmRunnerBackend(Enum):
     AITER = "aiter"
     HALOPS = "halops"
     XPU_SCALED_MM = "xpu_scaled_mm"
+    HUMMING = "humming"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -499,6 +500,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_xpu_scaled_mm(self) -> bool:
         return self == Fp8GemmRunnerBackend.XPU_SCALED_MM
+
+    def is_humming(self) -> bool:
+        return self == Fp8GemmRunnerBackend.HUMMING
 
 
 class Mxfp8DenseGemmBackend(Enum):
@@ -1380,6 +1384,12 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "but that backend requires an Intel XPU."
             )
         return torch_w8a8_block_fp8_linear
+
+    elif backend.is_humming():
+        raise RuntimeError(
+            "FP8 GEMM backend 'humming' is supported for per-tensor/per-channel "
+            "ModelOpt FP8 linears, not blockwise W8A8 FP8."
+        )
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
