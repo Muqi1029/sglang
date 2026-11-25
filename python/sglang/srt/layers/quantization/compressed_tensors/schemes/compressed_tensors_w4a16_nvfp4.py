@@ -196,6 +196,8 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
         if self.has_input_global_scale:
             del layer.input_global_scale
 
+        # Humming keeps one global scale per fused projection, so it skips the
+        # shared-global-scale requirement below.
         if get_fp4_gemm_runner_backend().is_humming():
             from sglang.srt.layers.quantization.nvfp4_humming import (
                 prepare_nvfp4_layer_for_humming,

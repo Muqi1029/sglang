@@ -556,9 +556,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.use_humming = get_fp8_gemm_runner_backend().is_humming()
         if self.use_humming and not humming_fp8_supported():
-            raise RuntimeError(
-                "FP8 GEMM backend 'humming' requires CUDA SM89+ (Ada/Hopper/Blackwell)."
+            logger.warning_once(
+                "--fp8-gemm-backend=humming needs CUDA SM89+; using the default "
+                "FP8 kernels."
             )
+            self.use_humming = False
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.enable_flashinfer_bmm = (
             False if self.use_humming else flashinfer_per_tensor_fp8_supported()

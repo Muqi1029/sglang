@@ -23,10 +23,11 @@ from sglang.srt.layers.moe.moe_runner.humming import (  # noqa: E402
     HummingRunnerInput,
 )
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend  # noqa: E402
+from sglang.srt.layers.quantization import nvfp4_humming  # noqa: E402
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend  # noqa: E402
 from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
     Fp8GemmRunnerBackend,
-    _dispatch_explicit_backend,
+    dispatch_w8a8_block_fp8_linear,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (  # noqa: E402
     ModelOptFp4Config,
@@ -158,9 +159,38 @@ class TestHummingFp8AndFusion(CustomTestCase):
                     should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
                 )
 
-        # 4. Blockwise FP8 rejects explicit --fp8-gemm-backend humming loudly.
-        with self.assertRaises(RuntimeError):
-            _dispatch_explicit_backend(Fp8GemmRunnerBackend.HUMMING)
+        # 4. Block FP8 layers fall back to the auto backend under humming.
+        dispatch_path = (
+            "sglang.srt.layers.quantization.fp8_utils.get_fp8_gemm_runner_backend"
+        )
+        with patch(dispatch_path, return_value=Fp8GemmRunnerBackend.HUMMING):
+            humming_linear = dispatch_w8a8_block_fp8_linear([128, 128])
+        with patch(dispatch_path, return_value=Fp8GemmRunnerBackend.AUTO):
+            auto_linear = dispatch_w8a8_block_fp8_linear([128, 128])
+        self.assertIs(humming_linear, auto_linear)
+
+    def test_chunked_nvfp4_requant_matches_unchunked(self):
+        from humming.schema import HummingWeightSchema
+
+        group16, group32 = (
+            HummingWeightSchema(
+                b_dtype="float4e2m1",
+                weight_scale_group_size=g,
+                weight_scale_type="group",
+                weight_scale_2_type="none",
+            )
+            for g in (16, 32)
+        )
+        w = torch.randn(320, 256, dtype=torch.bfloat16, device="cuda")
+        tensors = group16.quant_tensor(w, group16, torch.bfloat16)
+        expected = group16.requant_tensors(tensors, group32, torch.bfloat16)
+        with patch.object(nvfp4_humming, "_REQUANT_CHUNK_N", 128):
+            chunked = nvfp4_humming.requant_humming_tensors_chunked(
+                group16, tensors, group32, torch.bfloat16
+            )
+        self.assertEqual(expected.keys(), chunked.keys())
+        for name in expected:
+            torch.testing.assert_close(chunked[name], expected[name], rtol=0, atol=0)
 
     def test_nvfp4_lm_head_excluded_from_f16_accum(self):
         fp4_cfg = ModelOptFp4Config(

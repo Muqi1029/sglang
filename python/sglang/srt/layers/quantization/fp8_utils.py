@@ -804,6 +804,12 @@ def dispatch_w8a8_block_fp8_linear(
     2. Auto-detection based on hardware capabilities
     """
     backend = get_fp8_gemm_runner_backend()
+    if backend.is_humming():
+        # Humming serves per-tensor/per-channel ModelOpt FP8 only.
+        print_warning_once(
+            "--fp8-gemm-backend=humming does not cover block FP8; using auto."
+        )
+        backend = Fp8GemmRunnerBackend.AUTO
     # Native block32 DeepGEMM is the default on SM90. SM100 DeepGEMM casts the
     # weight scales to UE8M0, so it takes only UE8M0 checkpoints, on request.
     if (
@@ -1384,12 +1390,6 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "but that backend requires an Intel XPU."
             )
         return torch_w8a8_block_fp8_linear
-
-    elif backend.is_humming():
-        raise RuntimeError(
-            "FP8 GEMM backend 'humming' is supported for per-tensor/per-channel "
-            "ModelOpt FP8 linears, not blockwise W8A8 FP8."
-        )
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")

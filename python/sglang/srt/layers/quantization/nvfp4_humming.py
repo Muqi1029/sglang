@@ -285,8 +285,8 @@ def prepare_moe_nvfp4_layer_for_humming(
             num_experts=layer.num_local_experts,
             use_deepep_fp8_dispatch=use_deepep_fp8_dispatch,
         )
-        if use_fp8:
-            torch.cuda.empty_cache()
+    if use_fp8:
+        torch.cuda.empty_cache()
 
     layer.register_buffer(
         "locks",
@@ -301,6 +301,32 @@ def _validate_nvfp4_humming(group_size: int, label: str) -> None:
         raise ValueError(f"{label} requires an NVIDIA SM80+ GPU.")
     if group_size != 16:
         raise ValueError(f"{label} requires group_size=16, got {group_size}.")
+
+
+def requant_humming_tensors_chunked(
+    schema, tensors: dict[str, torch.Tensor], target_schema, param_dtype
+) -> dict[str, torch.Tensor]:
+    """schema.requant_tensors over N chunks, bounding FP32 dequant temporaries."""
+    shape_n = tensors["weight"].shape[-2]
+
+    def rows(t: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        if t.ndim >= 2 and t.shape[-2] == shape_n:
+            return t[..., start:end, :]
+        if t.ndim >= 1 and t.shape[-1] == shape_n:  # per-channel secondary scale
+            return t[..., start:end]
+        return t  # per-tensor scale
+
+    chunks = [
+        schema.requant_tensors(
+            {k: rows(v, start, start + _REQUANT_CHUNK_N) for k, v in tensors.items()},
+            target_schema,
+            param_dtype,
+        )
+        for start in range(0, shape_n, _REQUANT_CHUNK_N)
+    ]
+    if len(chunks) == 1:
+        return chunks[0]
+    return {k: torch.cat([c[k] for c in chunks], dim=-2) for k in chunks[0]}
 
 
 def _requant_nvfp4_to_group32(

@@ -314,8 +314,9 @@ class HummingRunnerCore(MoeRunnerCore):
         if gate_up_dtype.num_bits != 16:
             required_buffers.append("quanted_gate_up_input")
         required_buffers.append("gate_up_output")
-        # Fused SiLU+mul+FP8 skips activation_output so gate_up_output and
-        # quanted_down_input never share the same workspace buffer.
+        # Buffers alternate between two workspaces, so each kernel's input and
+        # output must be adjacent here. The fused SiLU+mul+FP8 kernel reads
+        # gate_up_output and writes quanted_down_input directly.
         if not self._can_fuse_silu_and_mul_w2():
             required_buffers.append("activation_output")
         if down_dtype.num_bits != 16:

@@ -181,6 +181,9 @@ def _adapt_nvfp4_without_block_scaled_mma(
     param_dtype,
 ):
     """Adapt NVFP4 and FP8 schemas on SM80-SM90 GPUs (including A30 and L40)."""
+    from sglang.srt.layers.quantization.nvfp4_humming import (
+        requant_humming_tensors_chunked,
+    )
     from sglang.srt.utils.device import get_device_capability, is_cuda
 
     _lazy_import_humming()
@@ -217,11 +220,9 @@ def _adapt_nvfp4_without_block_scaled_mma(
             weight_scale_type="group",
             weight_scale_2_type="none",
         )
-        bias = weight_tensors.get("bias")
-        weight_tensors = weight_schema.requant_tensors(
-            tensors=weight_tensors,
-            target_weight_schema=target_weight,
-            param_dtype=param_dtype,
+        bias = weight_tensors.pop("bias", None)
+        weight_tensors = requant_humming_tensors_chunked(
+            weight_schema, weight_tensors, target_weight, param_dtype
         )
         if bias is not None:
             weight_tensors["bias"] = bias
@@ -659,6 +660,57 @@ _MIXED_FUSED_PROJECTIONS = {
 }
 
 
+def _find_mixed_layer_info(
+    quantized_layers: dict[str, Any], prefix: str, packed_mapping: dict
+) -> dict[str, Any] | None:
+    """Return the quantized_layers entry for a layer, or None if unquantized.
+
+    Fused projections (qkv_proj, gate_up_proj) resolve from their shards and
+    parent modules (e.g. MoE experts) from their children; all must agree.
+    """
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    candidates = ModelOptMixedPrecisionConfig._quantized_layer_prefix_candidates
+    for c in candidates(prefix):
+        if isinstance(quantized_layers.get(c), dict):
+            return quantized_layers[c]
+
+    base, _, proj = prefix.rpartition(".")
+    shards = packed_mapping.get(proj) or _MIXED_FUSED_PROJECTIONS.get(proj)
+    infos = {}
+    if base and shards:
+        for c in candidates(base):
+            for shard in shards:
+                if isinstance(info := quantized_layers.get(f"{c}.{shard}"), dict):
+                    infos[shard] = info
+        if infos and len(infos) != len(shards):
+            raise ValueError(
+                f"Fused layer {prefix} quantizes only {sorted(infos)} of {list(shards)}."
+            )
+    if not infos:
+        infos = {
+            k: v
+            for c in candidates(prefix)
+            for k, v in quantized_layers.items()
+            if k.startswith(f"{c}.") and isinstance(v, dict)
+        }
+    if not infos:
+        return None
+
+    schemes = {
+        (str(v.get("quant_algo") or "").upper(), v.get("group_size"))
+        for v in infos.values()
+    }
+    if len(schemes) > 1:
+        raise ValueError(
+            f"Layer {prefix} mixes quantization schemes {schemes}; "
+            "all shards or experts must use the same one."
+        )
+    return next(iter(infos.values()))
+
+
 def _modelopt_mixed_layer_config(
     config: dict[str, Any], prefix: str
 ) -> dict[str, Any] | None:
@@ -671,54 +723,9 @@ def _modelopt_mixed_layer_config(
     ):
         return config
 
-    from sglang.srt.layers.quantization.modelopt_quant import (
-        ModelOptMixedPrecisionConfig,
+    info = _find_mixed_layer_info(
+        quantized_layers, prefix, config.get("packed_modules_mapping") or {}
     )
-
-    candidates = ModelOptMixedPrecisionConfig._quantized_layer_prefix_candidates(prefix)
-    info = next(
-        (
-            quantized_layers[c]
-            for c in candidates
-            if isinstance(quantized_layers.get(c), dict)
-        ),
-        None,
-    )
-    if info is None and "." in prefix:
-        base, proj_name = prefix.rsplit(".", 1)
-        mapping = config.get("packed_modules_mapping") or {}
-        shards = mapping.get(proj_name) or _MIXED_FUSED_PROJECTIONS.get(proj_name)
-        if shards:
-            matched_infos = [
-                shard_info
-                for base_c in ModelOptMixedPrecisionConfig._quantized_layer_prefix_candidates(
-                    base
-                )
-                for shard_name in shards
-                if isinstance(
-                    shard_info := quantized_layers.get(f"{base_c}.{shard_name}"), dict
-                )
-            ]
-            algos = {
-                str(item.get("quant_algo") or "").upper() for item in matched_infos
-            }
-            if len(algos) > 1:
-                raise ValueError(
-                    f"Mixed quant_algo within fused layer {prefix}: {algos}. "
-                    "All shards must use the same quantization."
-                )
-            if matched_infos:
-                info = dict(matched_infos[-1])
-    if info is None:
-        info = next(
-            (
-                v
-                for c in candidates
-                for k, v in quantized_layers.items()
-                if k.startswith(f"{c}.") and isinstance(v, dict)
-            ),
-            None,
-        )
     if info is None:
         return None
 

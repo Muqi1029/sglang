@@ -563,20 +563,46 @@ class TestHummingCheckpointConfig(CustomTestCase):
         ).get_quant_config_for_layer("language_model.lm_head", "linear")
         self.assertEqual(mixed_lm_head.weight_schema.quant_algo, "NVFP4")
         self.assertEqual(mixed_lm_head.input_schema.get_activation_bits(), 16)
-        with self.assertRaisesRegex(ValueError, "same quantization"):
-            broken = HummingConfig(
+
+        def mixed_config(quantized_layers):
+            return HummingConfig(
                 {
                     "quant_method": "modelopt",
                     "quant_algo": "MIXED_PRECISION",
-                    "quantized_layers": {
-                        "model.layers.0.mlp.gate_proj": {"quant_algo": "NVFP4"},
-                        "model.layers.0.mlp.up_proj": {"quant_algo": "FP8"},
-                    },
+                    "quantized_layers": quantized_layers,
                 }
             )
-            broken.get_quant_config_for_layer(
-                "model.layers.0.mlp.gate_up_proj", "linear"
-            )
+
+        nvfp4 = {"quant_algo": "NVFP4", "group_size": 16}
+        for prefix, layers, error in (
+            (
+                "model.layers.0.mlp.gate_up_proj",
+                {
+                    "model.layers.0.mlp.gate_proj": nvfp4,
+                    "model.layers.0.mlp.up_proj": {"quant_algo": "FP8"},
+                },
+                "mixes quantization schemes",
+            ),
+            (
+                "model.layers.0.self_attn.qkv_proj",
+                {
+                    "model.layers.0.self_attn.q_proj": nvfp4,
+                    "model.layers.0.self_attn.k_proj": nvfp4,
+                },
+                "quantizes only",
+            ),
+            (
+                "model.layers.0.mlp.experts",
+                {
+                    "model.layers.0.mlp.experts.0.gate_proj": nvfp4,
+                    "model.layers.0.mlp.experts.1.gate_proj": {"quant_algo": "FP8"},
+                },
+                "mixes quantization schemes",
+            ),
+        ):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(ValueError, error):
+                    mixed_config(layers).get_quant_config_for_layer(prefix, "linear")
 
     def test_nvfp4_adaptation_preserves_non_nvfp4_four_bit_schemas(self):
         from humming.schema import HummingInputSchema, HummingWeightSchema
