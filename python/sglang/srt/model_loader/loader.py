@@ -4251,11 +4251,9 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             hf_folder, source.safetensors_index_file
         )
 
-        def _yield_cpu_passes(
+        def _split_cpu_targets(
             matched: Dict[str, nn.Parameter],
-            direct_files: List[str],
-            plain_files: List[str],
-        ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Tuple[int, int]], List[str]]:
             cpu_dsts: Dict[str, torch.Tensor] = {}
             cpu_slices: Dict[str, Tuple[int, int]] = {}
             plain_names: List[str] = []
@@ -4267,17 +4265,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                     cpu_dsts[ckpt_name] = dst
                 else:
                     plain_names.append(ckpt_name)
+            return cpu_dsts, cpu_slices, plain_names
 
-            if cpu_dsts and direct_files:
-                yield from runai_safetensors_weights_iterator(
-                    direct_files,
-                    False,
-                    "cpu",
-                    load_group=self.load_config.load_group,
-                    tensor_names=list(cpu_dsts.keys()),
-                    tensor_slices=cpu_slices,
-                    tensor_dsts=cpu_dsts,
-                )
+        def _yield_plain_cpu_pass(
+            plain_names: List[str],
+            plain_files: List[str],
+        ) -> Generator[Tuple[str, torch.Tensor], None, None]:
             if plain_names and plain_files:
                 extra = {}
                 if supports_exclude:
@@ -4291,6 +4284,24 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                     load_group=self.load_config.load_group,
                     **extra,
                 )
+
+        def _yield_cpu_passes(
+            matched: Dict[str, nn.Parameter],
+            direct_files: List[str],
+            plain_files: List[str],
+        ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+            cpu_dsts, cpu_slices, plain_names = _split_cpu_targets(matched)
+            if cpu_dsts and direct_files:
+                yield from runai_safetensors_weights_iterator(
+                    direct_files,
+                    False,
+                    "cpu",
+                    load_group=self.load_config.load_group,
+                    tensor_names=list(cpu_dsts.keys()),
+                    tensor_slices=cpu_slices,
+                    tensor_dsts=cpu_dsts,
+                )
+            yield from _yield_plain_cpu_pass(plain_names, plain_files)
 
         if index_path is not None:
             with open(index_path, "r") as f:
@@ -4357,6 +4368,70 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             plain_files = [p for p in hf_weights_files if p in cpu_plain_files_set]
 
             def _indexed_iter():
+                cpu_dsts, cpu_slices, plain_names = _split_cpu_targets(cpu_matched)
+                overlap_cpu_direct = bool(gpu_files and cpu_dsts and direct_files)
+
+                if overlap_cpu_direct:
+                    # Overlap direct-into-CPU-dst streaming (independent S3 client,
+                    # zero CUDA/NCCL calls) with the GPU distributed pass so CPU
+                    # Engram reads utilize the GPU header-read / setup window too.
+                    rank0_log(
+                        f"[RunAI Streamer] Streaming {len(cpu_dsts)} CPU direct-dst "
+                        f"tensor(s) from {len(direct_files)} shard(s) concurrently "
+                        f"with GPU pass ({len(gpu_files)} shard(s))"
+                    )
+                    cpu_results: List[Tuple[str, torch.Tensor]] = []
+                    cpu_error: List[BaseException] = []
+
+                    def _run_direct_cpu_stream() -> None:
+                        try:
+                            for item in runai_safetensors_weights_iterator(
+                                direct_files,
+                                False,
+                                "cpu",
+                                load_group=self.load_config.load_group,
+                                tensor_names=list(cpu_dsts.keys()),
+                                tensor_slices=cpu_slices,
+                                tensor_dsts=cpu_dsts,
+                                disable_tqdm=True,
+                            ):
+                                cpu_results.append(item)
+                        except BaseException as exc:
+                            cpu_error.append(exc)
+
+                    cpu_thread = threading.Thread(
+                        target=_run_direct_cpu_stream,
+                        name="runai-cpu-direct-stream",
+                        daemon=False,
+                    )
+                    cpu_thread.start()
+                    try:
+                        if allowed_ckpt_names is not None:
+                            gpu_extra = (
+                                {"tensor_names": gpu_allowed_names}
+                                if gpu_allowed_names
+                                else {}
+                            )
+                        elif shared_cpu_names:
+                            gpu_extra = {"exclude_tensor_names": shared_cpu_names}
+                        else:
+                            gpu_extra = {}
+                        yield from runai_safetensors_weights_iterator(
+                            gpu_files,
+                            self._is_distributed,
+                            self.target_device_str,
+                            load_group=self.load_config.load_group,
+                            **gpu_extra,
+                        )
+                    finally:
+                        cpu_thread.join()
+
+                    if cpu_error:
+                        raise cpu_error[0]
+                    yield from cpu_results
+                    yield from _yield_plain_cpu_pass(plain_names, plain_files)
+                    return
+
                 if gpu_files:
                     if allowed_ckpt_names is not None:
                         gpu_extra = (

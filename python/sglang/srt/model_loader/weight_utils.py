@@ -1957,6 +1957,7 @@ def runai_safetensors_weights_iterator(
     tensor_dsts: Optional[Dict[str, torch.Tensor]] = None,
     memory_limit: Optional[int] = None,
     excluded_names_out: Optional[Set[str]] = None,
+    disable_tqdm: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
@@ -1969,7 +1970,7 @@ def runai_safetensors_weights_iterator(
         and load_group.world_size != torch.distributed.get_world_size()
     ):
         is_distributed = False
-    enable_tqdm = (
+    enable_tqdm = (not disable_tqdm) and (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     device = device if is_distributed and is_cuda_alike() else "cpu"

@@ -656,8 +656,11 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                 yielded = list(loader._get_all_weights(config, model))
 
             self.assertEqual(len(calls), 2)
+            gpu_call = next(c for c in calls if c[1])
+            cpu_call = next(c for c in calls if not c[1])
+
             # Pass 1 (GPU): only gpu_shard (engram-only shard omitted!), distributed=True, excludes shared scale.
-            gpu_files, gpu_dist, gpu_dev, gpu_kw = calls[0]
+            gpu_files, gpu_dist, gpu_dev, gpu_kw = gpu_call
             self.assertEqual(gpu_files, [gpu_shard])
             self.assertTrue(gpu_dist)
             self.assertEqual(gpu_dev, "cuda:0")
@@ -666,10 +669,11 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
             )
 
             # Pass 2 (CPU direct-dst): both shards carrying engram weight/scale, distributed=False, device="cpu".
-            cpu_files, cpu_dist, cpu_dev, cpu_kw = calls[1]
+            cpu_files, cpu_dist, cpu_dev, cpu_kw = cpu_call
             self.assertEqual(cpu_files, [gpu_shard, engram_shard])
             self.assertFalse(cpu_dist)
             self.assertEqual(cpu_dev, "cpu")
+            self.assertTrue(cpu_kw.get("disable_tqdm"))
             self.assertEqual(
                 set(cpu_kw["tensor_names"]),
                 {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"},
@@ -943,6 +947,124 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
             self.assertEqual(
                 {n for n, _ in yielded}, {"mtp.0.e_proj.weight", "mtp.0.norm.weight"}
             )
+
+    def test_cpu_direct_dst_runs_concurrently_with_gpu_pass_and_propagates_errors(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as model_path:
+            gpu_shard = os.path.join(model_path, "model-00001-of-00002.safetensors")
+            cpu_shard = os.path.join(model_path, "model-00002-of-00002.safetensors")
+            save_file({"layers.0.attn.weight": torch.ones(2, 2)}, gpu_shard)
+            save_file({"layers.1.engram.embed.weight": torch.ones(4, 2)}, cpu_shard)
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as f:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "layers.0.attn.weight": os.path.basename(gpu_shard),
+                            "layers.1.engram.embed.weight": os.path.basename(cpu_shard),
+                        }
+                    },
+                    f,
+                )
+
+            p_w = torch.nn.Parameter(torch.zeros(4, 2), requires_grad=False)
+            dst_w = p_w.data[0:2]
+            p_w._runai_cpu_direct_load = ((0, 2), dst_w)
+
+            model = SimpleNamespace(
+                allow_patterns_overrides=None,
+                safetensors_index_file="model.safetensors.index.json",
+                named_parameters=lambda: [("model.layers.1.engram.embed.weight", p_w)],
+                remap_weight_name_to_dpsk_hf_format=lambda name: (
+                    "model." + name if name.startswith("layers.") else name
+                ),
+            )
+            config = SimpleNamespace(
+                model_path=model_path,
+                revision=None,
+                hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+            )
+            loader = loader_mod.RunaiModelStreamerLoader(
+                LoadConfig(
+                    load_format=LoadFormat.RUNAI_STREAMER,
+                    model_loader_extra_config={"distributed": True},
+                )
+            )
+            loader.target_device_str = "cuda:0"
+
+            # Barrier(2) proves both passes execute concurrently; serial execution would time out.
+            barrier = threading.Barrier(2, timeout=5.0)
+            thread_ids = {}
+
+            def concurrent_iter(
+                files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
+            ):
+                thread_ids["gpu" if is_distributed else "cpu"] = threading.get_ident()
+                barrier.wait()
+                if kwargs.get("tensor_dsts"):
+                    for k, dst in kwargs["tensor_dsts"].items():
+                        dst.fill_(5.0)
+                        yield k, dst
+                else:
+                    yield "layers.0.attn.weight", torch.ones(2, 2)
+
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    return_value=[gpu_shard, cpu_shard],
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_streamer_capabilities",
+                    return_value=(True, True, True),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    side_effect=concurrent_iter,
+                ),
+            ):
+                yielded = list(loader._get_all_weights(config, model))
+
+            self.assertNotEqual(thread_ids["gpu"], thread_ids["cpu"])
+            self.assertEqual(
+                [n for n, _ in yielded],
+                ["layers.0.attn.weight", "layers.1.engram.embed.weight"],
+            )
+            self.assertTrue(torch.all(dst_w == 5.0))
+
+            # Verify background CPU thread failure propagates cleanly after GPU pass finishes.
+            def failing_cpu_iter(
+                files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
+            ):
+                if kwargs.get("tensor_dsts"):
+                    raise RuntimeError("boom-cpu-stream")
+                yield "layers.0.attn.weight", torch.ones(2, 2)
+
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    return_value=[gpu_shard, cpu_shard],
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_streamer_capabilities",
+                    return_value=(True, True, True),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    side_effect=failing_cpu_iter,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom-cpu-stream"):
+                    list(loader._get_all_weights(config, model))
 
 
 if __name__ == "__main__":
