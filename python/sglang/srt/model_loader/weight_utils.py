@@ -10,6 +10,7 @@ import contextlib
 import fnmatch
 import glob
 import hashlib
+import inspect
 import itertools
 import json
 import logging
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Collection,
     Dict,
     Generator,
     Iterable,
@@ -1907,11 +1909,40 @@ def composed_weight_loader(
     return composed_loader
 
 
+def runai_streamer_capabilities() -> Tuple[bool, bool, bool]:
+    """Return (supports_exclude, supports_direct_dst, supports_memory_limit)
+    for the installed runai_model_streamer.SafetensorsStreamer.stream_files."""
+    from runai_model_streamer import SafetensorsStreamer
+
+    try:
+        params = inspect.signature(SafetensorsStreamer.stream_files).parameters
+    except (TypeError, ValueError):
+        return (False, False, False)
+
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if has_var_kw:
+        return (True, True, True)
+
+    supports_exclude = "exclude_tensor_names" in params and "tensor_names" in params
+    supports_direct_dst = (
+        supports_exclude and "tensor_dsts" in params and "tensor_slices" in params
+    )
+    supports_memory_limit = "memory_limit" in params
+    return (supports_exclude, supports_direct_dst, supports_memory_limit)
+
+
 def runai_safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_distributed: bool = False,
     device: str = "cpu",
     load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+    *,
+    tensor_names: Optional[Collection[str]] = None,
+    exclude_tensor_names: Optional[Collection[str]] = None,
+    tensor_slices: Optional[Dict[str, Tuple[int, int]]] = None,
+    tensor_dsts: Optional[Dict[str, torch.Tensor]] = None,
+    memory_limit: Optional[int] = None,
+    excluded_names_out: Optional[Set[str]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
@@ -1929,12 +1960,25 @@ def runai_safetensors_weights_iterator(
     )
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
+    stream_kwargs = {
+        "device": device,
+        "is_distributed": is_distributed,
+    }
+    if tensor_names is not None:
+        stream_kwargs["tensor_names"] = tensor_names
+    if exclude_tensor_names is not None:
+        stream_kwargs["exclude_tensor_names"] = exclude_tensor_names
+    if tensor_slices is not None:
+        stream_kwargs["tensor_slices"] = tensor_slices
+    if tensor_dsts is not None:
+        stream_kwargs["tensor_dsts"] = tensor_dsts
+    if memory_limit is not None:
+        stream_kwargs["memory_limit"] = memory_limit
+
     with SafetensorsStreamer() as streamer:
-        streamer.stream_files(
-            hf_weights_files,
-            device=device,
-            is_distributed=is_distributed,
-        )
+        streamer.stream_files(hf_weights_files, **stream_kwargs)
+        if excluded_names_out is not None:
+            excluded_names_out.update(getattr(streamer, "excluded_tensor_names", ()))
         total_tensors = sum(
             len(tensors_meta)
             for tensors_meta in streamer.files_to_tensors_metadata.values()
@@ -1949,10 +1993,12 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
+        mark_streamed = tensor_dsts is None
         for name, tensor in tensor_iter:
-            setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
-            # Views and detach() share storage but do not inherit tensor attributes.
-            setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
+            if mark_streamed:
+                setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+                # Views and detach() share storage but do not inherit tensor attributes.
+                setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
             yield name, tensor
 
 

@@ -551,6 +551,278 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
 
         self.assertIsInstance(model_loader, loader_mod.RemoteInstanceModelLoader)
 
+    def test_cpu_offload_split_indexed_direct_engram_and_gpu_pass(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            gpu_shard = os.path.join(model_path, "model-00001-of-00002.safetensors")
+            engram_shard = os.path.join(model_path, "model-00002-of-00002.safetensors")
+            save_file(
+                {
+                    "layers.0.attn.weight": torch.ones(4, 4),
+                    "layers.1.engram.embed.scale": torch.arange(
+                        16, dtype=torch.uint8
+                    ).reshape(4, 4),
+                },
+                gpu_shard,
+            )
+            save_file(
+                {
+                    "layers.1.engram.embed.weight": torch.arange(
+                        64, dtype=torch.uint8
+                    ).reshape(4, 16),
+                },
+                engram_shard,
+            )
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as f:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "layers.0.attn.weight": "model-00001-of-00002.safetensors",
+                            "layers.1.engram.embed.scale": "model-00001-of-00002.safetensors",
+                            "layers.1.engram.embed.weight": "model-00002-of-00002.safetensors",
+                        }
+                    },
+                    f,
+                )
+
+            shared_weight = torch.zeros((4, 16), dtype=torch.uint8)
+            shared_scale = torch.zeros((4, 4), dtype=torch.uint8)
+            dst_w = shared_weight[1:3]
+            dst_s = shared_scale[1:3]
+            p_engram_w = torch.nn.Parameter(shared_weight, requires_grad=False)
+            p_engram_s = torch.nn.Parameter(shared_scale, requires_grad=False)
+            p_engram_w._runai_cpu_direct_load = ((1, 3), dst_w)
+            p_engram_s._runai_cpu_direct_load = ((1, 3), dst_s)
+
+            class _FakeGpuParam:
+                device = torch.device("meta")
+
+            # Use a fake model whose CPU params use HF-prefixed names while checkpoint uses native names.
+            model = SimpleNamespace(
+                allow_patterns_overrides=None,
+                safetensors_index_file="model.safetensors.index.json",
+                named_parameters=lambda: [
+                    ("model.layers.1.engram.embed.weight", p_engram_w),
+                    ("model.layers.1.engram.embed.scale", p_engram_s),
+                ],
+                remap_weight_name_to_dpsk_hf_format=lambda name: (
+                    "model." + name if name.startswith("layers.") else name
+                ),
+            )
+            config = SimpleNamespace(
+                model_path=model_path,
+                revision=None,
+                hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+            )
+            loader = loader_mod.RunaiModelStreamerLoader(
+                LoadConfig(
+                    load_format=LoadFormat.RUNAI_STREAMER,
+                    model_loader_extra_config={"distributed": True},
+                )
+            )
+            loader.target_device_str = "cuda:0"
+
+            calls = []
+
+            def fake_iter(
+                files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
+            ):
+                calls.append((list(files), is_distributed, device, kwargs))
+                if kwargs.get("tensor_dsts"):
+                    for k, dst in kwargs["tensor_dsts"].items():
+                        yield k, dst
+                else:
+                    yield "layers.0.attn.weight", torch.ones(4, 4)
+
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    side_effect=lambda path: [gpu_shard, engram_shard],
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_streamer_capabilities",
+                    return_value=(True, True, True),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    side_effect=fake_iter,
+                ),
+            ):
+                yielded = list(loader._get_all_weights(config, model))
+
+            self.assertEqual(len(calls), 2)
+            # Pass 1 (GPU): only gpu_shard (engram-only shard omitted!), distributed=True, excludes shared scale.
+            gpu_files, gpu_dist, gpu_dev, gpu_kw = calls[0]
+            self.assertEqual(gpu_files, [gpu_shard])
+            self.assertTrue(gpu_dist)
+            self.assertEqual(gpu_dev, "cuda:0")
+            self.assertEqual(
+                gpu_kw["exclude_tensor_names"], ["layers.1.engram.embed.scale"]
+            )
+
+            # Pass 2 (CPU direct-dst): both shards carrying engram weight/scale, distributed=False, device="cpu".
+            cpu_files, cpu_dist, cpu_dev, cpu_kw = calls[1]
+            self.assertEqual(cpu_files, [gpu_shard, engram_shard])
+            self.assertFalse(cpu_dist)
+            self.assertEqual(cpu_dev, "cpu")
+            self.assertEqual(
+                set(cpu_kw["tensor_names"]),
+                {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"},
+            )
+            self.assertEqual(
+                cpu_kw["tensor_slices"],
+                {
+                    "layers.1.engram.embed.weight": (1, 3),
+                    "layers.1.engram.embed.scale": (1, 3),
+                },
+            )
+            self.assertIs(cpu_kw["tensor_dsts"]["layers.1.engram.embed.weight"], dst_w)
+            self.assertIs(cpu_kw["tensor_dsts"]["layers.1.engram.embed.scale"], dst_s)
+            self.assertEqual(
+                {name for name, _ in yielded},
+                {
+                    "layers.0.attn.weight",
+                    "layers.1.engram.embed.weight",
+                    "layers.1.engram.embed.scale",
+                },
+            )
+
+    def test_cpu_offload_split_unindexed_and_plain_cpu_param(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            shard = os.path.join(model_path, "model.safetensors")
+            save_file(
+                {
+                    "gpu.weight": torch.ones(2, 2),
+                    "model.cpu_buf.weight": torch.ones(4, 4),
+                },
+                shard,
+            )
+            p_cpu = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+            model = SimpleNamespace(
+                allow_patterns_overrides=None,
+                safetensors_index_file=None,
+                named_parameters=lambda: [("model.cpu_buf.weight", p_cpu)],
+            )
+            config = SimpleNamespace(
+                model_path=model_path,
+                revision=None,
+                hf_config=SimpleNamespace(architectures=["TestModel"]),
+            )
+            loader = loader_mod.RunaiModelStreamerLoader(
+                LoadConfig(
+                    load_format=LoadFormat.RUNAI_STREAMER,
+                    model_loader_extra_config={"distributed": True},
+                )
+            )
+            loader.target_device_str = "cuda:0"
+            calls = []
+
+            def fake_iter(
+                files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
+            ):
+                calls.append((list(files), is_distributed, device, kwargs))
+                if (
+                    "excluded_names_out" in kwargs
+                    and kwargs["excluded_names_out"] is not None
+                ):
+                    kwargs["excluded_names_out"].add("model.cpu_buf.weight")
+                    yield "gpu.weight", torch.ones(2, 2)
+                else:
+                    yield "model.cpu_buf.weight", torch.ones(4, 4)
+
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                patch.object(runai_utils, "list_safetensors", return_value=[shard]),
+                patch.object(
+                    weight_utils,
+                    "runai_streamer_capabilities",
+                    return_value=(True, True, True),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    side_effect=fake_iter,
+                ),
+            ):
+                yielded = list(loader._get_all_weights(config, model))
+
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0][1])
+            self.assertEqual(calls[0][2], "cuda:0")
+            self.assertIn("model.cpu_buf.weight", calls[0][3]["exclude_tensor_names"])
+            self.assertFalse(calls[1][1])
+            self.assertEqual(calls[1][2], "cpu")
+            self.assertEqual(calls[1][3]["tensor_names"], ["model.cpu_buf.weight"])
+            self.assertEqual(calls[1][3]["memory_limit"], 0)
+            self.assertEqual(
+                [n for n, _ in yielded], ["gpu.weight", "model.cpu_buf.weight"]
+            )
+
+    def test_engram_load_rows_in_place_fast_path(self):
+        from sglang.srt.layers.engram import EngramEmbedding
+
+        embed = object.__new__(EngramEmbedding)
+        torch.nn.Module.__init__(embed)
+        embed.row_start = 2
+        embed.rows = 3
+        embed.host_table = SimpleNamespace(dirty=False, replication="per_node")
+        shared = torch.zeros((6, 8), dtype=torch.uint8)
+        embed.weight = torch.nn.Parameter(shared, requires_grad=False)
+        embed.scale = torch.nn.Parameter(
+            torch.zeros((6, 1), dtype=torch.uint8), requires_grad=False
+        )
+
+        dst = shared[2:5]
+        dst.fill_(7)
+        embed._load_rows(embed.weight, dst)
+
+        self.assertTrue(embed.host_table.dirty)
+        self.assertTrue(torch.all(shared[2:5] == 7))
+        self.assertEqual(shared[:2].sum().item(), 0)
+        self.assertEqual(shared[5:].sum().item(), 0)
+
+    def test_direct_dst_tensors_are_not_marked_as_reused_runai_buffers(self):
+        dst = torch.zeros((2, 4), dtype=torch.float32)
+
+        class FakeStreamer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def stream_files(self, files, **kwargs):
+                self.files_to_tensors_metadata = {0: [object()]}
+                self.kwargs = kwargs
+
+            def get_tensors(self):
+                dst.fill_(3.0)
+                yield "engram.weight", dst
+
+        with patch.dict(
+            sys.modules,
+            {"runai_model_streamer": SimpleNamespace(SafetensorsStreamer=FakeStreamer)},
+        ):
+            weights = list(
+                weight_utils.runai_safetensors_weights_iterator(
+                    ["model.safetensors"],
+                    is_distributed=False,
+                    device="cpu",
+                    tensor_names=["engram.weight"],
+                    tensor_slices={"engram.weight": (0, 2)},
+                    tensor_dsts={"engram.weight": dst},
+                )
+            )
+
+        self.assertEqual(len(weights), 1)
+        self.assertIs(weights[0][1], dst)
+        self.assertFalse(getattr(dst, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, False))
+
 
 if __name__ == "__main__":
     unittest.main()

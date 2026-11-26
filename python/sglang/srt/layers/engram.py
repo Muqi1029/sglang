@@ -1396,6 +1396,23 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+        self._attach_cpu_direct_load_spec(self.weight)
+        self._attach_cpu_direct_load_spec(self.scale)
+
+    def _attach_cpu_direct_load_spec(self, param: nn.Parameter) -> None:
+        """Expose this rank's dim-0 row slice and contiguous CPU destination so
+        RunaiModelStreamerLoader can stream only this rank's rows straight into
+        CPU memory without routing the table through GPU VRAM or a host ring."""
+        if param.device.type != "cpu":
+            return
+        rows = slice(self.row_start, self.row_start + self.rows)
+        dst = param.data[rows] if self._shared else param.data
+        if not dst.is_contiguous():
+            return
+        param._runai_cpu_direct_load = (
+            (self.row_start, self.row_start + self.rows),
+            dst,
+        )
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1441,6 +1458,17 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        rows = slice(self.row_start, self.row_start + self.rows)
+        dst = param.data[rows] if self._shared else param.data
+        # Fast path: RunAI streamed this rank's row slice straight into dst.
+        if (
+            loaded_weight.device == dst.device
+            and loaded_weight.data_ptr() == dst.data_ptr()
+            and loaded_weight.shape == dst.shape
+        ):
+            if self.host_table is not None:
+                self.host_table.dirty = True
+            return
         if self.weight.dtype == torch.int8:
             if param is self.scale:
                 if loaded_weight.dtype not in (torch.float8_e8m0fnu, torch.uint8):
@@ -1448,8 +1476,6 @@ class EngramEmbedding(nn.Module):
                 loaded_weight = loaded_weight.view(torch.uint8)
             elif loaded_weight.dtype != torch.int8:
                 raise ValueError("INT8 Engram weights must have dtype torch.int8")
-        rows = slice(self.row_start, self.row_start + self.rows)
-        dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
         # Outside ModelSlim INT8 scales, uint8 denotes a packed MXFP4 table.
         src_mxfp4, dst_mxfp4 = src.dtype == torch.uint8, dst.dtype == torch.uint8
