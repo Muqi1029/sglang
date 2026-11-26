@@ -4134,6 +4134,96 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 return cpu_params[with_model]
         return None
 
+    @staticmethod
+    def _resolve_local_index_path(
+        hf_folder: str, index_file: Optional[str]
+    ) -> Optional[str]:
+        if index_file is None:
+            return None
+        from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+
+        candidate = (
+            os.path.abspath(
+                os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
+            )
+            if is_runai_obj_uri(hf_folder)
+            else os.path.join(hf_folder, index_file)
+        )
+        return candidate if os.path.isfile(candidate) else None
+
+    def _filter_indexed_weights_for_model(
+        self,
+        hf_folder: str,
+        hf_weights_files: List[str],
+        source: Source,
+        model: Optional[nn.Module],
+    ) -> Tuple[List[str], Optional[List[str]]]:
+        """Narrow shard files and checkpoint tensor names before streaming when
+        the model exposes ``filter_checkpoint_weight_names`` (e.g. NextN/MTP
+        draft models sharing a full multi-shard checkpoint)."""
+        filter_fn = getattr(model, "filter_checkpoint_weight_names", None)
+        if not callable(filter_fn):
+            return hf_weights_files, None
+
+        index_path = self._resolve_local_index_path(
+            hf_folder, source.safetensors_index_file
+        )
+        if index_path is None:
+            return hf_weights_files, None
+
+        with open(index_path, "r") as f:
+            weight_map = json.load(f).get("weight_map", {})
+
+        by_base = {os.path.basename(p): p for p in hf_weights_files}
+        indexed_paths = set()
+        prefixed_to_ckpt: Dict[str, str] = {}
+        for ckpt_name, shard_file in weight_map.items():
+            full_path = by_base.get(os.path.basename(shard_file))
+            if full_path is None:
+                continue
+            indexed_paths.add(full_path)
+            prefixed_to_ckpt[source.prefix + ckpt_name] = ckpt_name
+
+        # If any shard is unindexed (e.g. auto-added mtp.safetensors), keep the
+        # full list so unindexed tensors are never silently dropped.
+        if not prefixed_to_ckpt or any(
+            p not in indexed_paths for p in hf_weights_files
+        ):
+            return hf_weights_files, None
+
+        kept_prefixed = filter_fn(prefixed_to_ckpt.keys())
+        if not kept_prefixed:
+            return hf_weights_files, None
+
+        kept_prefixed_set = set(kept_prefixed)
+        selected_ckpt_names = [
+            ckpt_name
+            for prefixed, ckpt_name in prefixed_to_ckpt.items()
+            if prefixed in kept_prefixed_set
+        ]
+        if not selected_ckpt_names:
+            return hf_weights_files, None
+
+        selected_files_set = {
+            by_base[os.path.basename(weight_map[ckpt_name])]
+            for ckpt_name in selected_ckpt_names
+        }
+        needed_files = [p for p in hf_weights_files if p in selected_files_set]
+
+        from sglang.srt.model_loader.weight_utils import (
+            runai_streamer_supports_tensor_names,
+        )
+
+        tensor_names_filter = (
+            selected_ckpt_names if runai_streamer_supports_tensor_names() else None
+        )
+        rank0_log(
+            f"[RunAI Streamer] Filtered checkpoint for {type(model).__name__}: "
+            f"{len(needed_files)}/{len(hf_weights_files)} shard(s), "
+            f"{len(selected_ckpt_names)}/{len(prefixed_to_ckpt)} tensor(s)"
+        )
+        return needed_files, tensor_names_filter
+
     def _stream_with_cpu_offload_split(
         self,
         hf_folder: str,
@@ -4141,6 +4231,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         source: Source,
         model: nn.Module,
         cpu_params: Dict[str, nn.Parameter],
+        allowed_ckpt_names: Optional[set[str]] = None,
     ) -> Optional[Generator[Tuple[str, torch.Tensor], None, None]]:
         """Route CPU-resident parameters (e.g. CPU Engram tables) out of the GPU
         distributed stream so giant host tables neither trigger GPU VRAM OOM nor
@@ -4149,7 +4240,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             runai_safetensors_weights_iterator,
             runai_streamer_capabilities,
         )
-        from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
         supports_exclude, supports_direct_dst, supports_memory_limit = (
             runai_streamer_capabilities()
@@ -4157,20 +4247,9 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
         # Resolve local index file when available so we know exact checkpoint names
         # and which shard files belong to GPU vs CPU tensors without extra I/O.
-        index_path = None
-        if source.safetensors_index_file is not None:
-            candidate = (
-                os.path.abspath(
-                    os.path.join(
-                        ObjectStorageModel.get_path(hf_folder),
-                        source.safetensors_index_file,
-                    )
-                )
-                if is_runai_obj_uri(hf_folder)
-                else os.path.join(hf_folder, source.safetensors_index_file)
-            )
-            if os.path.isfile(candidate):
-                index_path = candidate
+        index_path = self._resolve_local_index_path(
+            hf_folder, source.safetensors_index_file
+        )
 
         def _yield_cpu_passes(
             matched: Dict[str, nn.Parameter],
@@ -4223,6 +4302,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             cpu_direct_files_set = set()
             cpu_plain_files_set = set()
             gpu_files_set = set()
+            gpu_allowed_names: List[str] = []
             shared_cpu_names: List[str] = []
 
             for ckpt_name, shard_file in weight_map.items():
@@ -4230,6 +4310,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 if full_path is None:
                     continue
                 indexed_paths.add(full_path)
+                if (
+                    allowed_ckpt_names is not None
+                    and ckpt_name not in allowed_ckpt_names
+                ):
+                    continue
                 param = self._match_cpu_param(
                     ckpt_name, source.prefix, cpu_params, model
                 )
@@ -4241,6 +4326,8 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                         cpu_plain_files_set.add(full_path)
                 else:
                     gpu_files_set.add(full_path)
+                    if allowed_ckpt_names is not None:
+                        gpu_allowed_names.append(ckpt_name)
 
             if not cpu_matched:
                 return None
@@ -4256,7 +4343,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 if full_path in gpu_files_set:
                     shared_cpu_names.append(ckpt_name)
 
-            if shared_cpu_names and not supports_exclude:
+            if shared_cpu_names and allowed_ckpt_names is None and not supports_exclude:
                 logger.warning(
                     "Model has CPU-resident weights (%d tensor(s)) sharing shard files "
                     "with GPU weights, but the installed runai_model_streamer does not "
@@ -4271,11 +4358,16 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
             def _indexed_iter():
                 if gpu_files:
-                    gpu_extra = (
-                        {"exclude_tensor_names": shared_cpu_names}
-                        if shared_cpu_names
-                        else {}
-                    )
+                    if allowed_ckpt_names is not None:
+                        gpu_extra = (
+                            {"tensor_names": gpu_allowed_names}
+                            if gpu_allowed_names
+                            else {}
+                        )
+                    elif shared_cpu_names:
+                        gpu_extra = {"exclude_tensor_names": shared_cpu_names}
+                    else:
+                        gpu_extra = {}
                     yield from runai_safetensors_weights_iterator(
                         gpu_files,
                         self._is_distributed,
@@ -4351,6 +4443,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 source.model_config.hf_config,
             )
 
+        hf_weights_files, selected_tensor_names = (
+            self._filter_indexed_weights_for_model(
+                hf_folder, hf_weights_files, source, model
+            )
+        )
+
         weights_iterator = None
         cpu_params = self._collect_cpu_params(model)
         if cpu_params and (
@@ -4358,15 +4456,30 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             or any(hasattr(p, "_runai_cpu_direct_load") for p in cpu_params.values())
         ):
             weights_iterator = self._stream_with_cpu_offload_split(
-                hf_folder, hf_weights_files, source, model, cpu_params
+                hf_folder,
+                hf_weights_files,
+                source,
+                model,
+                cpu_params,
+                allowed_ckpt_names=(
+                    set(selected_tensor_names)
+                    if selected_tensor_names is not None
+                    else None
+                ),
             )
 
         if weights_iterator is None:
+            extra_kwargs = (
+                {"tensor_names": selected_tensor_names}
+                if selected_tensor_names is not None
+                else {}
+            )
             weights_iterator = runai_safetensors_weights_iterator(
                 hf_weights_files,
                 self._is_distributed,
                 self.target_device_str,
                 load_group=self.load_config.load_group,
+                **extra_kwargs,
             )
 
         if self.load_config.draft_model_idx is not None:

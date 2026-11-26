@@ -1909,6 +1909,20 @@ def composed_weight_loader(
     return composed_loader
 
 
+def runai_streamer_supports_tensor_names() -> bool:
+    """Return True if the installed SafetensorsStreamer.stream_files accepts tensor_names."""
+    from runai_model_streamer import SafetensorsStreamer
+
+    try:
+        params = inspect.signature(SafetensorsStreamer.stream_files).parameters
+    except (TypeError, ValueError):
+        return False
+
+    return "tensor_names" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def runai_streamer_capabilities() -> Tuple[bool, bool, bool]:
     """Return (supports_exclude, supports_direct_dst, supports_memory_limit)
     for the installed runai_model_streamer.SafetensorsStreamer.stream_files."""

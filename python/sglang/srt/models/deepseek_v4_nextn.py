@@ -301,6 +301,34 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             hidden_states_before_norm=pre_hc_head,
         )
 
+    def filter_checkpoint_weight_names(
+        self, weight_names: Iterable[str]
+    ) -> Optional[set[str]]:
+        """Return the subset of checkpoint tensor names actually consumed by
+        NextN/MTP loading so streaming loaders avoid fetching the full target
+        model (and huge CPU Engram tables) from a shared checkpoint."""
+        if not hasattr(self.config, "num_nextn_predict_layers"):
+            return None
+        nextn_layer_id = (
+            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+        )
+        nextn_layer_prefix = f"model.layers.{nextn_layer_id}."
+        kept: set[str] = set()
+        for raw_name in weight_names:
+            remapped = self.remap_weight_name_to_dpsk_hf_format(
+                raw_name,
+                is_nextn=True,
+                num_hidden_layers=self.config.num_hidden_layers,
+            )
+            if "shared_head.head" in remapped or "embed_tokens" in remapped:
+                continue
+            if not remapped.startswith(nextn_layer_prefix):
+                continue
+            if "rotary_emb.inv_freq" in remapped:
+                continue
+            kept.add(raw_name)
+        return kept if kept else None
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 

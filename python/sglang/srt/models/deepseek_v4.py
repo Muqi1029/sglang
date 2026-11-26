@@ -5639,6 +5639,12 @@ class DeepseekV4ForCausalLM(
                 num_experts=self.config.n_routed_experts
             )
 
+        # Index expert mappings by weight_name ("experts.<id>.<proj>.") for O(1)
+        # dispatch instead of an O(num_experts) linear scan per tensor.
+        expert_mapping_by_weight_name: dict[str, list[tuple[str, str, int, str]]] = {}
+        for mapping in expert_params_mapping:
+            expert_mapping_by_weight_name.setdefault(mapping[1], []).append(mapping)
+
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
@@ -5790,10 +5796,22 @@ class DeepseekV4ForCausalLM(
                         break
                     else:
                         skip_unmaterialized_expert_param = False
-                        for mapping in expert_params_mapping:
+                        matched_expert_mappings = ()
+                        search_pos = name.find("experts.")
+                        while search_pos != -1:
+                            end1 = name.find(".", search_pos + 8)
+                            if end1 != -1:
+                                end2 = name.find(".", end1 + 1)
+                                if end2 != -1:
+                                    candidate = expert_mapping_by_weight_name.get(
+                                        name[search_pos : end2 + 1]
+                                    )
+                                    if candidate is not None:
+                                        matched_expert_mappings = candidate
+                                        break
+                            search_pos = name.find("experts.", search_pos + 8)
+                        for mapping in matched_expert_mappings:
                             param_name, weight_name, expert_id, shard_id = mapping
-                            if weight_name not in name:
-                                continue
                             resolved_name = name.replace(weight_name, param_name)
                             if resolved_name not in params_dict:
                                 skip_unmaterialized_expert_param = True
