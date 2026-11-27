@@ -1066,6 +1066,132 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "boom-cpu-stream"):
                     list(loader._get_all_weights(config, model))
 
+    def test_dspark_draft_model_filters_only_mtp_shards_and_tensors(self):
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+
+        draft_model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        torch.nn.Module.__init__(draft_model)
+        draft_model.confidence_head = None
+        draft_model.uses_own_vocab_modules = False
+        draft_model.num_stages = 1
+
+        ckpt_names = [
+            "embed.tok_emb.weight",
+            "layers.1.engram.embed.weight",
+            "layers.14.engram.embed.weight",
+            "layers.59.ffn.experts.0.w1.weight",
+            "norm.weight",
+            "head.weight",
+            "mtp.0.attn.wo_a.weight",
+            "mtp.0.attn.wo_a.scale",
+            "mtp.0.ffn.experts.0.w1.weight",
+            "mtp.0.markov_head.embed.weight",
+            "mtp.0.confidence_head.weight",
+            "mtp.0.attn.gate.bias_vl",
+            "mtp.0.attn.rotary_emb.inv_freq",
+        ]
+        kept = draft_model.filter_checkpoint_weight_names(ckpt_names)
+        self.assertEqual(
+            kept,
+            {
+                "mtp.0.attn.wo_a.weight",
+                "mtp.0.attn.wo_a.scale",
+                "mtp.0.ffn.experts.0.w1.weight",
+                "mtp.0.markov_head.embed.weight",
+            },
+        )
+
+        # When confidence_head is enabled, its weights are included.
+        draft_model.confidence_head = object()
+        kept_with_conf = draft_model.filter_checkpoint_weight_names(ckpt_names)
+        self.assertIn("mtp.0.confidence_head.weight", kept_with_conf)
+
+        # End-to-end RunaiModelStreamerLoader shard & tensor_names narrowing for DSpark.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shard_main = os.path.join(tmpdir, "model-00001-of-00003.safetensors")
+            shard_engram = os.path.join(tmpdir, "model-00002-of-00003.safetensors")
+            shard_mtp = os.path.join(tmpdir, "model-00003-of-00003.safetensors")
+            for p in (shard_main, shard_engram, shard_mtp):
+                with open(p, "wb") as f:
+                    f.write(b"")
+            with open(os.path.join(tmpdir, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "layers.59.ffn.experts.0.w1.weight": os.path.basename(
+                                shard_main
+                            ),
+                            "layers.1.engram.embed.weight": os.path.basename(
+                                shard_engram
+                            ),
+                            "layers.14.engram.embed.weight": os.path.basename(
+                                shard_mtp
+                            ),
+                            "mtp.0.attn.wo_a.weight": os.path.basename(shard_mtp),
+                            "mtp.0.ffn.experts.0.w1.weight": os.path.basename(
+                                shard_mtp
+                            ),
+                        }
+                    },
+                    f,
+                )
+
+            config = SimpleNamespace(
+                model_path=tmpdir,
+                revision=None,
+                hf_config=SimpleNamespace(
+                    architectures=["DeepseekV4ForCausalLMDSpark"]
+                ),
+            )
+            loader = loader_mod.RunaiModelStreamerLoader(
+                LoadConfig(
+                    load_format=LoadFormat.RUNAI_STREAMER,
+                    model_loader_extra_config={"distributed": True},
+                )
+            )
+            loader.target_device_str = "cuda:0"
+            calls = []
+
+            def fake_iter(
+                files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
+            ):
+                calls.append((list(files), is_distributed, device, kwargs))
+                for n in kwargs.get("tensor_names", []):
+                    yield n, torch.ones(2, 2)
+
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    return_value=[shard_main, shard_engram, shard_mtp],
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_streamer_supports_tensor_names",
+                    return_value=True,
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    side_effect=fake_iter,
+                ),
+            ):
+                yielded = list(loader._get_all_weights(config, draft_model))
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], [shard_mtp])
+            self.assertTrue(calls[0][1])
+            self.assertEqual(calls[0][2], "cuda:0")
+            self.assertEqual(
+                set(calls[0][3]["tensor_names"]),
+                {"mtp.0.attn.wo_a.weight", "mtp.0.ffn.experts.0.w1.weight"},
+            )
+            self.assertEqual(
+                {n for n, _ in yielded},
+                {"mtp.0.attn.wo_a.weight", "mtp.0.ffn.experts.0.w1.weight"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

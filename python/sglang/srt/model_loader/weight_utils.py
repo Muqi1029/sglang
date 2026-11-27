@@ -2040,6 +2040,18 @@ def set_runai_streamer_env(load_config: LoadConfig):
     if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
+    # Avoid EC2 IMDS lookup timeout (~5s per client) against custom S3/OSS endpoints.
+    if (
+        os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
+        or os.getenv("AWS_ENDPOINT_URL")
+        or os.getenv("AWS_ENDPOINT_URL_S3")
+    ):
+        os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+
+    # Enable application-level retries for transient object-storage errors (5xx/429/reset)
+    # unless explicitly configured by the user.
+    os.environ.setdefault("RUNAI_STREAMER_S3_TIMEOUT", "60")
+
 
 @torch.no_grad()
 def initialize_capture_safe_weights(

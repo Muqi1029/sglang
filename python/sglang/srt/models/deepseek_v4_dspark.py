@@ -1027,6 +1027,36 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_head=self.markov_head,
         )
 
+    def filter_checkpoint_weight_names(
+        self, weight_names: Iterable[str]
+    ) -> Optional[set[str]]:
+        """Return only checkpoint tensor names consumed by DSpark draft loading
+        so streaming loaders skip the target model layers and giant CPU Engram
+        tables when sharing a full checkpoint."""
+        kept: set[str] = set()
+        use_npu_remap = _is_npu and not is_npu_arch35()
+        for raw_name in weight_names:
+            mapped = (
+                remap_dspark_weight_name_npu(raw_name)
+                if use_npu_remap
+                else self._remap_dspark_weight_name(raw_name)
+            )
+            if mapped is None:
+                continue
+            if _is_npu and mapped in ("embed_tokens.weight", "lm_head.weight"):
+                if not self.uses_own_vocab_modules:
+                    continue
+                stage_idx = int(raw_name.split(".", 2)[1])
+                vocab_stage = (
+                    0 if mapped == "embed_tokens.weight" else self.num_stages - 1
+                )
+                if stage_idx != vocab_stage:
+                    continue
+            if mapped.startswith("confidence_head.") and self.confidence_head is None:
+                continue
+            kept.add(raw_name)
+        return kept if kept else None
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
@@ -1043,6 +1073,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=(n_routed_experts + self.num_fused_shared_experts),
         )
+        expert_mapping_by_weight_name: dict[str, list[tuple[str, str, int, str]]] = {}
+        for mapping in expert_params_mapping:
+            expert_mapping_by_weight_name.setdefault(mapping[1], []).append(mapping)
 
         for name, loaded_weight in weights:
             mapped = (
@@ -1080,14 +1113,26 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 loaded_params.add(candidate)
                 break
             else:
+                matched_expert_mappings = ()
+                search_pos = mapped.find("experts.")
+                while search_pos != -1:
+                    end1 = mapped.find(".", search_pos + 8)
+                    if end1 != -1:
+                        end2 = mapped.find(".", end1 + 1)
+                        if end2 != -1:
+                            candidate = expert_mapping_by_weight_name.get(
+                                mapped[search_pos : end2 + 1]
+                            )
+                            if candidate is not None:
+                                matched_expert_mappings = candidate
+                                break
+                    search_pos = mapped.find("experts.", search_pos + 8)
                 for (
                     param_name,
                     weight_name,
                     expert_id,
                     shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in mapped:
-                        continue
+                ) in matched_expert_mappings:
                     candidate = mapped.replace(weight_name, param_name)
                     if candidate not in params_dict:
                         continue
