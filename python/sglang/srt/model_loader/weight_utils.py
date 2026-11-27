@@ -1958,18 +1958,17 @@ def runai_safetensors_weights_iterator(
     memory_limit: Optional[int] = None,
     excluded_names_out: Optional[Set[str]] = None,
     disable_tqdm: bool = False,
+    before_close: Optional[Callable[[], None]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    before_close, when given, runs while the streamer is still open, after its
+    last tensor or on error, so a caller can hold the native streamer alive
+    until a concurrent streamer has finished reading.
+    """
     from runai_model_streamer import SafetensorsStreamer
 
-    # RunAI's distributed mode spans the whole world; a stage-local draft load
-    # must stream independently to avoid waiting for the other PP stages.
-    if load_group is None or (
-        load_group is not _DEFAULT_LOAD_GROUP
-        and torch.distributed.is_initialized()
-        and load_group.world_size != torch.distributed.get_world_size()
-    ):
-        is_distributed = False
+    is_distributed = _runai_effective_is_distributed(is_distributed, load_group)
     enable_tqdm = (not disable_tqdm) and (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1991,30 +1990,83 @@ def runai_safetensors_weights_iterator(
         stream_kwargs["memory_limit"] = memory_limit
 
     with SafetensorsStreamer() as streamer:
-        streamer.stream_files(hf_weights_files, **stream_kwargs)
-        if excluded_names_out is not None:
-            excluded_names_out.update(getattr(streamer, "excluded_tensor_names", ()))
-        total_tensors = sum(
-            len(tensors_meta)
-            for tensors_meta in streamer.files_to_tensors_metadata.values()
+        try:
+            streamer.stream_files(hf_weights_files, **stream_kwargs)
+            if excluded_names_out is not None:
+                excluded_names_out.update(
+                    getattr(streamer, "excluded_tensor_names", ())
+                )
+            total_tensors = sum(
+                len(tensors_meta)
+                for tensors_meta in streamer.files_to_tensors_metadata.values()
+            )
+
+            tensor_iter = tqdm(
+                streamer.get_tensors(),
+                total=total_tensors,
+                desc="Loading safetensors using Runai Model Streamer",
+                bar_format=BAR_FORMAT,
+                disable=not enable_tqdm,
+                mininterval=2,
+            )
+
+            mark_streamed = tensor_dsts is None
+            for name, tensor in tensor_iter:
+                if mark_streamed:
+                    setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+                    # Views and detach() share storage but do not inherit tensor attributes.
+                    setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
+                yield name, tensor
+        finally:
+            if before_close is not None:
+                before_close()
+
+
+def _runai_effective_is_distributed(
+    is_distributed: bool, load_group: Optional[LoadGroup]
+) -> bool:
+    # RunAI's distributed mode spans the whole world; a stage-local draft load
+    # must stream independently to avoid waiting for the other PP stages.
+    if not is_distributed or load_group is None:
+        return False
+    if (
+        load_group is not _DEFAULT_LOAD_GROUP
+        and torch.distributed.is_initialized()
+        and load_group.world_size != torch.distributed.get_world_size()
+    ):
+        return False
+    return True
+
+
+def prime_runai_rank_discovery(
+    is_distributed: bool, load_group: Optional[LoadGroup]
+) -> None:
+    """Run RunAI's local-rank discovery now, on the calling thread.
+
+    Discovery writes RUNAI_STREAMER_PROCESS_GROUP_SIZE into os.environ the first
+    time a distributed stream starts. Doing it before any background streamer
+    thread exists keeps that setenv from racing getenv calls in libstreamer's
+    native threads. The streamer would run the same collective anyway, and the
+    result is cached per job, so this adds no collective.
+    """
+    if not (
+        _runai_effective_is_distributed(is_distributed, load_group)
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    ):
+        return
+    try:
+        from runai_model_streamer.distributed_streamer.distributed_streamer import (
+            _distributedStreamerParams,
         )
 
-        tensor_iter = tqdm(
-            streamer.get_tensors(),
-            total=total_tensors,
-            desc="Loading safetensors using Runai Model Streamer",
-            bar_format=BAR_FORMAT,
-            disable=not enable_tqdm,
-            mininterval=2,
-        )
-
-        mark_streamed = tensor_dsts is None
-        for name, tensor in tensor_iter:
-            if mark_streamed:
-                setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
-                # Views and detach() share storage but do not inherit tensor attributes.
-                setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
-            yield name, tensor
+        params = _distributedStreamerParams()
+        params.broadcast_timeout = params.get_broadcast_timeout()
+        params.discover_local_ranks()
+    except Exception:
+        # A failed discovery marks distribution lost inside runai_model_streamer;
+        # the GPU stream then falls back on its own.
+        logger.warning("RunAI rank discovery failed", exc_info=True)
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
@@ -2040,8 +2092,10 @@ def set_runai_streamer_env(load_config: LoadConfig):
     if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
-    # Avoid EC2 IMDS lookup timeout (~5s per client) against custom S3/OSS endpoints.
-    if (
+    # Avoid the EC2 IMDS region lookup (~5s per client) against custom S3/OSS
+    # endpoints. Only with static keys in the environment: credentials resolved
+    # through IMDS (instance roles) would break with IMDS disabled.
+    if os.getenv("AWS_ACCESS_KEY_ID") and (
         os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
         or os.getenv("AWS_ENDPOINT_URL")
         or os.getenv("AWS_ENDPOINT_URL_S3")

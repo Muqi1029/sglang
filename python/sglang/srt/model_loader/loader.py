@@ -4224,6 +4224,84 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         )
         return needed_files, tensor_names_filter
 
+    def _overlap_gpu_and_cpu_direct_streams(
+        self,
+        gpu_files: List[str],
+        gpu_extra: Dict,
+        direct_files: List[str],
+        cpu_dsts: Dict[str, torch.Tensor],
+        cpu_slices: Dict[str, Tuple[int, int]],
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Stream CPU direct-dst tensors on a background thread while the GPU
+        pass runs, then yield the (already filled) CPU destinations.
+
+        Closing a libstreamer object-storage streamer cancels every S3 client in
+        the process (S3Stop -> cancel_all_reads), not just its own. So neither
+        streamer may close while the other is still reading: the CPU streamer
+        stays open until the GPU pass has drained, and the GPU streamer closes
+        only after the CPU thread has finished.
+        """
+        from sglang.srt.model_loader.weight_utils import (
+            prime_runai_rank_discovery,
+            runai_safetensors_weights_iterator,
+        )
+
+        rank0_log(
+            f"[RunAI Streamer] Streaming {len(cpu_dsts)} CPU direct-dst tensor(s) "
+            f"from {len(direct_files)} shard(s) concurrently with the GPU pass "
+            f"({len(gpu_files)} shard(s))"
+        )
+        prime_runai_rank_discovery(self._is_distributed, self.load_config.load_group)
+
+        gpu_drained = threading.Event()
+        cpu_results: List[Tuple[str, torch.Tensor]] = []
+        cpu_error: List[BaseException] = []
+
+        def _run_cpu_stream() -> None:
+            try:
+                cpu_results.extend(
+                    runai_safetensors_weights_iterator(
+                        direct_files,
+                        False,
+                        "cpu",
+                        load_group=self.load_config.load_group,
+                        tensor_names=list(cpu_dsts.keys()),
+                        tensor_slices=cpu_slices,
+                        tensor_dsts=cpu_dsts,
+                        disable_tqdm=True,
+                        before_close=gpu_drained.wait,
+                    )
+                )
+            except BaseException as exc:
+                cpu_error.append(exc)
+
+        cpu_thread = threading.Thread(
+            target=_run_cpu_stream, name="runai-cpu-direct-stream"
+        )
+
+        def _close_gpu_after_cpu() -> None:
+            gpu_drained.set()
+            cpu_thread.join()
+
+        cpu_thread.start()
+        try:
+            yield from runai_safetensors_weights_iterator(
+                gpu_files,
+                self._is_distributed,
+                self.target_device_str,
+                load_group=self.load_config.load_group,
+                before_close=_close_gpu_after_cpu,
+                **gpu_extra,
+            )
+        finally:
+            # Also covers a GPU pass that failed before opening its streamer.
+            gpu_drained.set()
+            cpu_thread.join()
+
+        if cpu_error:
+            raise cpu_error[0]
+        yield from cpu_results
+
     def _stream_with_cpu_offload_split(
         self,
         hf_folder: str,
@@ -4369,80 +4447,27 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
             def _indexed_iter():
                 cpu_dsts, cpu_slices, plain_names = _split_cpu_targets(cpu_matched)
-                overlap_cpu_direct = bool(gpu_files and cpu_dsts and direct_files)
-
-                if overlap_cpu_direct:
-                    # Overlap direct-into-CPU-dst streaming (independent S3 client,
-                    # zero CUDA/NCCL calls) with the GPU distributed pass so CPU
-                    # Engram reads utilize the GPU header-read / setup window too.
-                    rank0_log(
-                        f"[RunAI Streamer] Streaming {len(cpu_dsts)} CPU direct-dst "
-                        f"tensor(s) from {len(direct_files)} shard(s) concurrently "
-                        f"with GPU pass ({len(gpu_files)} shard(s))"
+                if allowed_ckpt_names is not None:
+                    gpu_extra = (
+                        {"tensor_names": gpu_allowed_names} if gpu_allowed_names else {}
                     )
-                    cpu_results: List[Tuple[str, torch.Tensor]] = []
-                    cpu_error: List[BaseException] = []
+                elif shared_cpu_names:
+                    gpu_extra = {"exclude_tensor_names": shared_cpu_names}
+                else:
+                    gpu_extra = {}
 
-                    def _run_direct_cpu_stream() -> None:
-                        try:
-                            for item in runai_safetensors_weights_iterator(
-                                direct_files,
-                                False,
-                                "cpu",
-                                load_group=self.load_config.load_group,
-                                tensor_names=list(cpu_dsts.keys()),
-                                tensor_slices=cpu_slices,
-                                tensor_dsts=cpu_dsts,
-                                disable_tqdm=True,
-                            ):
-                                cpu_results.append(item)
-                        except BaseException as exc:
-                            cpu_error.append(exc)
-
-                    cpu_thread = threading.Thread(
-                        target=_run_direct_cpu_stream,
-                        name="runai-cpu-direct-stream",
-                        daemon=False,
+                if gpu_files and cpu_dsts and direct_files:
+                    yield from self._overlap_gpu_and_cpu_direct_streams(
+                        gpu_files,
+                        gpu_extra,
+                        direct_files,
+                        cpu_dsts,
+                        cpu_slices,
                     )
-                    cpu_thread.start()
-                    try:
-                        if allowed_ckpt_names is not None:
-                            gpu_extra = (
-                                {"tensor_names": gpu_allowed_names}
-                                if gpu_allowed_names
-                                else {}
-                            )
-                        elif shared_cpu_names:
-                            gpu_extra = {"exclude_tensor_names": shared_cpu_names}
-                        else:
-                            gpu_extra = {}
-                        yield from runai_safetensors_weights_iterator(
-                            gpu_files,
-                            self._is_distributed,
-                            self.target_device_str,
-                            load_group=self.load_config.load_group,
-                            **gpu_extra,
-                        )
-                    finally:
-                        cpu_thread.join()
-
-                    if cpu_error:
-                        raise cpu_error[0]
-                    yield from cpu_results
                     yield from _yield_plain_cpu_pass(plain_names, plain_files)
                     return
 
                 if gpu_files:
-                    if allowed_ckpt_names is not None:
-                        gpu_extra = (
-                            {"tensor_names": gpu_allowed_names}
-                            if gpu_allowed_names
-                            else {}
-                        )
-                    elif shared_cpu_names:
-                        gpu_extra = {"exclude_tensor_names": shared_cpu_names}
-                    else:
-                        gpu_extra = {}
                     yield from runai_safetensors_weights_iterator(
                         gpu_files,
                         self._is_distributed,

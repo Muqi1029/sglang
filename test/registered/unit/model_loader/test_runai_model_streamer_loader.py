@@ -997,18 +997,27 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
             # Barrier(2) proves both passes execute concurrently; serial execution would time out.
             barrier = threading.Barrier(2, timeout=5.0)
             thread_ids = {}
+            events = []
 
             def concurrent_iter(
                 files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
             ):
-                thread_ids["gpu" if is_distributed else "cpu"] = threading.get_ident()
-                barrier.wait()
-                if kwargs.get("tensor_dsts"):
-                    for k, dst in kwargs["tensor_dsts"].items():
-                        dst.fill_(5.0)
-                        yield k, dst
-                else:
-                    yield "layers.0.attn.weight", torch.ones(2, 2)
+                kind = "gpu" if is_distributed else "cpu"
+                thread_ids[kind] = threading.get_ident()
+                try:
+                    barrier.wait()
+                    if kwargs.get("tensor_dsts"):
+                        for k, dst in kwargs["tensor_dsts"].items():
+                            dst.fill_(5.0)
+                            yield k, dst
+                    else:
+                        yield "layers.0.attn.weight", torch.ones(2, 2)
+                finally:
+                    # Mirrors runai_safetensors_weights_iterator: before_close runs
+                    # while the (native) streamer is still open.
+                    events.append(f"{kind}_drained")
+                    kwargs["before_close"]()
+                    events.append(f"{kind}_closed")
 
             with (
                 patch.object(loader_mod, "get_server_args", return_value=None),
@@ -1036,6 +1045,48 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                 ["layers.0.attn.weight", "layers.1.engram.embed.weight"],
             )
             self.assertTrue(torch.all(dst_w == 5.0))
+            # Neither streamer closes while the other still reads: closing one
+            # cancels every S3 client in the process. The CPU streamer closes only
+            # after the GPU pass drained, and the GPU streamer closes last.
+            self.assertLess(events.index("gpu_drained"), events.index("cpu_closed"))
+            self.assertLess(events.index("cpu_drained"), events.index("gpu_closed"))
+            self.assertEqual(events[-1], "gpu_closed")
+
+            # A failing GPU pass must not deadlock against the waiting CPU thread.
+            def failing_gpu_iter(
+                files, is_distributed, device, load_group=_DEFAULT_LOAD_GROUP, **kwargs
+            ):
+                try:
+                    if is_distributed:
+                        raise RuntimeError("boom-gpu-stream")
+                    for k, dst in kwargs["tensor_dsts"].items():
+                        yield k, dst
+                finally:
+                    kwargs["before_close"]()
+
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    return_value=[gpu_shard, cpu_shard],
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_streamer_capabilities",
+                    return_value=(True, True, True),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    side_effect=failing_gpu_iter,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom-gpu-stream"):
+                    list(loader._get_all_weights(config, model))
+            self.assertFalse(
+                any(t.name == "runai-cpu-direct-stream" for t in threading.enumerate())
+            )
 
             # Verify background CPU thread failure propagates cleanly after GPU pass finishes.
             def failing_cpu_iter(
