@@ -3,6 +3,8 @@
 import json
 import math
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, List
 
 import regex as re
@@ -1015,6 +1017,97 @@ class HummingLinearMethod(LinearMethodBase):
             "gemm_type": "dense",
         }
         self.compute_config = json.dumps(compute_config)
+
+    @contextmanager
+    def maybe_use_cp_decode_tp(self, layer, tp_rank: int, tp_size: int):
+        """Use a cached CP-rank partition of packed FP8 attention weights."""
+        from humming.config import WeightScale2Type, WeightScaleType
+
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        cache = getattr(layer, "_cp_decode_tp_cache", None)
+        if cache is None:
+            cache = layer._cp_decode_tp_cache = {}
+        key = (tp_rank, tp_size)
+        if key not in cache:
+            meta = layer.humming_metas[""]
+            # Equal-bit W8A8 retains [N, K/4] packed words in Humming 0.1.18;
+            # W8A16 uses [K tiles, N packed values]. Scales are transposed.
+            if not (
+                isinstance(layer, (ColumnParallelLinear, RowParallelLinear))
+                and meta.b_dtype == DataType.from_torch_dtype(torch.float8_e4m3fn)
+                and meta.weight_scale_type
+                in (WeightScaleType.GROUP, WeightScaleType.BLOCK)
+                and meta.weight_scale_2_type == WeightScale2Type.NONE
+                # Humming 0.1.18 keeps mma_type on TuningConfig; this is the
+                # equivalent of mma_type in (MMA, WGMMA) on LayerConfig.
+                and not meta.is_umma_supported
+                and not meta.use_block_scaled_mma
+                and not meta.use_fused_e8m0_scale
+                and not meta.use_int_weight_scale
+                and not meta.pad_shape_n
+                and not meta.pad_shape_k
+                and not meta.has_bias
+                and not meta.has_zero_point
+            ):
+                raise NotImplementedError(
+                    "Humming CP decode attention TP requires unpadded, bias-free "
+                    "MMA/WGMMA group- or block-scaled FP8 attention linears"
+                )
+            column = isinstance(layer, ColumnParallelLinear)
+            shape_name = "shape_n" if column else "shape_k"
+            size = getattr(meta, shape_name)
+            alignment = 256 if column else 128
+            if size % (tp_size * alignment):
+                raise ValueError(
+                    f"Humming CP decode TP {shape_name}={size} must divide into "
+                    f"{tp_size} partitions aligned to {alignment}"
+                )
+            state = {}
+            for name in ("weight", "weight_scale"):
+                if name == "weight" and meta.use_flat_weight:
+                    # Flat W8 tiles are [K/16, N/64, 64, 4] packed words,
+                    # then reshaped to [N, K/4]. Slice before flattening again.
+                    tensor = layer.weight.view(
+                        meta.shape_k // 16, meta.shape_n // 64, 64, 4
+                    )
+                    dim = 1 if column else 0
+                    width = tensor.shape[dim] // tp_size
+                    n = meta.shape_n // tp_size if column else meta.shape_n
+                    k = meta.shape_k if column else meta.shape_k // tp_size
+                    state[name] = torch.nn.Parameter(
+                        tensor.narrow(dim, tp_rank * width, width)
+                        .contiguous()
+                        .view(n, k // 4),
+                        requires_grad=False,
+                    )
+                    continue
+                raw_weight = name == "weight" and (
+                    meta.use_raw_weight
+                    or meta.a_dtype.num_bits == meta.b_dtype.num_bits
+                )
+                dim = (0 if column else 1) if raw_weight else (1 if column else 0)
+                tensor = getattr(layer, name)
+                if tensor.shape[dim] % tp_size:
+                    raise ValueError(f"Humming CP decode TP cannot partition {name}")
+                width = tensor.shape[dim] // tp_size
+                state[name] = torch.nn.Parameter(
+                    tensor.narrow(dim, tp_rank * width, width).contiguous(),
+                    requires_grad=False,
+                )
+            state["humming_metas"] = {
+                "": replace(meta, **{shape_name: size // tp_size})
+            }
+            cache[key] = state
+        state = cache[key]
+        original = {name: getattr(layer, name) for name in state}
+        try:
+            for name, value in state.items():
+                setattr(layer, name, value)
+            yield
+        finally:
+            for name, value in original.items():
+                setattr(layer, name, value)
 
     def apply(
         self,

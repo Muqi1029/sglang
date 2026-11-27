@@ -7,7 +7,7 @@ partition attention weights across CP ranks matching normal TP behavior.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -270,11 +270,20 @@ class CpDecodeAttnTpContext:
         size_overrides = []  # (linear, size_attr, orig_size)
         row_parallel_decode_flags = []  # (RowParallelLinear, orig_flag) to restore
         orig_tp_q_head_num = None
+        quant_contexts = ExitStack()
         try:
             for linear in modules:
-                for obj, attr_name, dim in self._get_linear_attrs(linear):
-                    self._activate(obj, attr_name, dim)
-                    all_attrs.append((obj, attr_name))
+                quant_context = getattr(
+                    linear.quant_method, "maybe_use_cp_decode_tp", None
+                )
+                if quant_context is not None:
+                    quant_contexts.enter_context(
+                        quant_context(linear, self.decode_tp_rank, self.decode_tp_size)
+                    )
+                else:
+                    for obj, attr_name, dim in self._get_linear_attrs(linear):
+                        self._activate(obj, attr_name, dim)
+                        all_attrs.append((obj, attr_name))
                 from sglang.srt.layers.linear import RowParallelLinear
 
                 size_attr = (
@@ -309,6 +318,7 @@ class CpDecodeAttnTpContext:
                 radix_attn.tp_q_head_num = orig_tp_q_head_num // self.decode_tp_size
             yield
         finally:
+            quant_contexts.close()
             if radix_attn is not None and orig_tp_q_head_num is not None:
                 radix_attn.tp_q_head_num = orig_tp_q_head_num
             for linear, orig_flag in reversed(row_parallel_decode_flags):
